@@ -918,6 +918,85 @@ This is a design gap in commit 7, not a bug in the code as specified. Tracked as
 D7. It needs a decision from Ashrit about how a merchant first gets named, and
 the options are not equivalent, so it is not being guessed at.
 
+### 2026-08-08: The dashboard is a web app, and it ships loopback-only first
+
+Ashrit asked for a web dashboard reached from a button in Telegram, Rocket Money
+in shape if not in scope. There is no dashboard anywhere in the brief, so this
+is a scope addition rather than a commit off the section 17 list, and it is
+recorded here rather than assumed.
+
+**Loopback first, public second, and never public without authentication.** The
+server binds `127.0.0.1` and `HOST` is deliberately not readable from the
+environment: making the ledger reachable from the internet should require
+editing code and thinking about it, not flipping a variable. Invariant 3 means
+there is no name, address, phone or card number in there to leak, which
+materially limits the damage, but it is still a record of what someone bought.
+
+Phase 2 adds a public HTTPS address and authentication **in the same change**,
+never one without the other.
+
+### 2026-08-08: No web framework, and no new dependency
+
+`http.server` from the standard library. A framework would be right for
+sessions, forms, uploads and real concurrency; this is four read-only routes for
+one user, and section 23.1 has no web framework on it. Adding FastAPI or Flask
+would have meant an invariant 12 conversation to buy ergonomics we do not need.
+
+The pages are hand-rendered strings with `html.escape` on every interpolation,
+for the same reason: Jinja2 is allowlisted but uninstalled, and four pages do
+not justify pulling it in.
+
+**Every value on the page is escaped, and that is not paranoia.** Brief 21.4
+treats extracted text as untrusted input to the prompt because a receipt image
+is something a stranger can craft. The same text is equally untrusted as input
+to a page. Two tests put a `<script>` tag through a line item and an adjustment
+label and assert it comes out inert.
+
+The page is fully self-contained: no scripts, no external stylesheet, no fonts,
+no images. A test asserts no `http://` or `https://` appears anywhere in the
+output. It has to render over a tunnel, on a phone, with no CDN.
+
+### 2026-08-08: The dashboard is read-only by construction, not by convention
+
+Nothing in `raseed/web/` imports `db.ledger`. There is no write path to get
+wrong. `POST` returns 405 with an `Allow: GET` header rather than a 404, because
+"this endpoint does not accept writes" and "this endpoint does not exist" are
+different facts.
+
+### 2026-08-08: `rupees` moved to `raseed.money`
+
+The bot and the dashboard both format money, and money formatting duplicated in
+two places drifts. A ledger whose Telegram total disagrees with its dashboard
+total is worse than one with no dashboard. `money(minor, currency)` handles the
+currency column that has existed since commit 4 and had no formatter.
+
+### 2026-08-08: Two bugs the dashboard tests caught before the page shipped
+
+- **The "this date was guessed" warning would never have appeared.**
+  `Row.date_source` carries `DateSource.MESSAGE_TIMESTAMP.value`, which is
+  `"message_timestamp"`, and the renderer compared it against the uppercase
+  member name. Brief 24.4 requires that a guessed date is visibly a guess, so a
+  silently-never-firing warning defeats the requirement entirely. Both live
+  receipts have `MESSAGE_TIMESTAMP`, so this would have been wrong on 100% of
+  real data.
+- **The category slices do not sum to the grand total, on purpose.** Categories
+  live on line items, so the slices cover the basket and exclude charges, taxes
+  and order-level discounts. A test asserts the inequality rather than papering
+  over it, and the page states it in words. Presenting a total that does not
+  reconcile would undo the entire point of the gate.
+
+### 2026-08-08: The merchant gap (D7) is closed by decision, not by code
+
+Ashrit: *"we don't need the merchant's name honestly so you can ignore that
+part."* D7 is dismissed. `merchant_id` stays nullable and unused, the quick-pick
+stays as written, and the merchants table stays empty.
+
+**Consequence, recorded so it can be revisited cheaply:** the dashboard lists
+receipts as "09 Aug 2026, 6 items, ₹256.00" and not "Blinkit ₹256.00". If that
+reads as a gap once there are fifty rows in the table, seeding a handful of
+common merchants is a small change and nothing built since depends on their
+absence.
+
 ---
 
 ## Still open

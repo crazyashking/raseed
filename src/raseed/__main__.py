@@ -16,7 +16,7 @@ import logging
 import sys
 from typing import Final
 
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from raseed.adapters.flow import FlowConfig, ReceiptFlow
 from raseed.adapters.images import ImageStore
@@ -27,6 +27,7 @@ from raseed.db.engine import create_engine
 from raseed.db.seed import bootstrap
 from raseed.extraction.providers.gemini import GeminiProvider
 from raseed.timezones import TimezoneDatabaseMissingError, zone
+from raseed.web import server as web
 
 log = logging.getLogger("raseed")
 
@@ -51,7 +52,7 @@ def now_utc() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
 
 
-def build(settings: Settings) -> tuple[RaseedBot, ImageStore]:
+def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Session]]:
     """Assemble everything from settings. No side effects beyond the engine."""
     engine = create_engine(settings.database_url)
     sessions = sessionmaker(bind=engine)
@@ -77,8 +78,9 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore]:
         session_factory=sessions,
         allowed_user_ids=settings.telegram_allowed_user_ids,
         clock=now_utc,
+        dashboard_url=f"http://{web.HOST}:{web.DEFAULT_PORT}/",
     )
-    return bot, images
+    return bot, images, sessions
 
 
 def main() -> int:
@@ -107,7 +109,11 @@ def main() -> int:
         )
         return 2
 
-    bot, images = build(settings)
+    bot, images, sessions = build(settings)
+
+    # Loopback only. See `web/server.py`: this is not reachable off the machine,
+    # and it does not become reachable without authentication landing with it.
+    web.serve(session_factory=sessions, clock=now_utc, port=web.DEFAULT_PORT)
 
     # A crash between extraction and confirm strands an image on disk, and the
     # pending store that knew about it lives in memory. Invariant 7.

@@ -39,6 +39,7 @@ from raseed.extraction.providers.base import (
     ImagePayload,
     ProviderError,
 )
+from raseed.money import rupees
 from raseed.timezones import zone
 from raseed.validation.reconcile import (
     DEFAULT_TOLERANCE_MINOR,
@@ -368,13 +369,6 @@ class ReceiptFlow:
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
-
-
-def rupees(minor: int) -> str:
-    """Format integer paise for a human. Never builds a float."""
-    sign = "-" if minor < 0 else ""
-    whole, paise = divmod(abs(minor), 100)
-    return f"{sign}₹{whole:,}.{paise:02d}"
 
 
 def summarise(receipt: PendingReceipt) -> str:

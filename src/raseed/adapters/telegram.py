@@ -58,7 +58,8 @@ GREETING: Final[str] = (
     "Send me a picture of a receipt and I will read it, check the arithmetic, "
     "and show you what I got before saving anything.\n\n"
     "/recent shows the last few.\n"
-    "/undo removes the most recent one."
+    "/undo removes the most recent one.\n"
+    "/dashboard opens the full view."
 )
 
 
@@ -121,11 +122,13 @@ class RaseedBot:
         session_factory: sessionmaker[Session],
         allowed_user_ids: frozenset[int],
         clock: Callable[[], dt.datetime],
+        dashboard_url: str | None = None,
     ) -> None:
         self._flow = flow
         self._sessions = session_factory
         self._allowed = allowed_user_ids
         self._clock = clock
+        self._dashboard_url = dashboard_url
 
     # -- access control ------------------------------------------------------
 
@@ -247,6 +250,22 @@ class RaseedBot:
         ]
         await update.message.reply_text("\n".join(lines))
 
+    async def dashboard(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Hand over the dashboard link.
+
+        A plain message rather than an inline button, because Telegram will not
+        render a URL button for `http://127.0.0.1`: it demands https and a real
+        host. That is the correct restriction and not one to work around. When
+        the dashboard gets a public HTTPS address, this becomes a button and the
+        authentication lands in the same change.
+        """
+        if not self.permitted(update) or update.message is None:
+            return
+        if self._dashboard_url is None:
+            await update.message.reply_text("The dashboard is not running in this process.")
+            return
+        await update.message.reply_text(f"Your dashboard:\n{self._dashboard_url}")
+
     async def undo(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         """Soft delete the newest row. Never a hard delete. Invariant 2."""
         if not self.permitted(update) or update.message is None:
@@ -285,6 +304,7 @@ class RaseedBot:
         application.add_handler(CommandHandler("help", self.start))
         application.add_handler(CommandHandler("recent", self.recent))
         application.add_handler(CommandHandler("undo", self.undo))
+        application.add_handler(CommandHandler("dashboard", self.dashboard))
         application.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         application.add_handler(MessageHandler(filters.Document.IMAGE, self.on_document))
         application.add_handler(CallbackQueryHandler(self.on_button))
