@@ -39,6 +39,8 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from dotenv import load_dotenv  # noqa: E402
+
 from raseed.extraction.pricing import cost_micros, format_usd  # noqa: E402
 from raseed.extraction.providers.base import (  # noqa: E402
     ExtractionRequest,
@@ -187,7 +189,9 @@ def live_run(provider: GeminiProvider, paths: list[pathlib.Path]) -> int:
         flag = "ok  " if score.fields_match else "DIFF"
         print(
             f"  {flag} {image.stem:14s} gate={verdict.outcome.value:12s} "
-            f"mrp={mrp.outcome.value:15s} {format_usd(result.cost_micros_usd)}"
+            f"mrp={mrp.outcome.value:15s} in={result.input_tokens:5d} "
+            f"out={result.output_tokens:5d} (think {result.thought_tokens:4d}) "
+            f"{format_usd(result.cost_micros_usd)}"
         )
         for line in differences:
             print(f"         {line}")
@@ -232,6 +236,9 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="score only the first N receipts")
     parser.add_argument("--model", default=None, help="override GEMINI_MODEL")
     args = parser.parse_args()
+
+    # Real environment variables win over .env, which is what you want on a host.
+    load_dotenv(ROOT / ".env", override=False)
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:

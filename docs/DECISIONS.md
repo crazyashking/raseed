@@ -583,9 +583,90 @@ without `GEMINI_API_KEY`, and has a `--dry-run` mode that calls the free
 `count_tokens` endpoint and prints the projected cost before anything is
 authorised.
 
----
+### 2026-08-08: First live call, and a correction to the commit 6 message
 
-## Resolved decisions
+**The offline schema check was necessary but not sufficient, and I said otherwise.**
+Commit 6 claimed the contract "converts cleanly, so it holds". Conversion held.
+API acceptance did not. The first live call failed with a 400:
+
+```
+Unknown name "additional_properties" at 'generation_config.response_schema'
+```
+
+`extra="forbid"` on the Pydantic models becomes `additional_properties` in the
+converted schema, and the Gemini API rejects that field outright. It converts
+without complaint locally, so nothing short of a real request could find it.
+
+Four shapes were probed against the live API rather than guessed at:
+
+| Shape | Result |
+|---|---|
+| `response_schema=ExtractionResult` | **400**, rejects `additional_properties` |
+| `response_schema=` converted Schema, field stripped | works |
+| `response_json_schema=model_json_schema()` | works |
+| `response_json_schema=` stripped | works |
+
+**Chosen: build the wire schema through the public `JSONSchema` to `Schema`
+conversion, then pin `property_ordering` on every object explicitly.** The
+`response_json_schema` path also works and is simpler, but it relies on the API
+honouring dictionary key order, which is not a documented guarantee.
+`property_ordering` is the documented mechanism, and section 21.2 is too
+load-bearing to rest on luck. The private `_transformers.t_schema` was avoided.
+
+Dropping `additional_properties` from the wire schema weakens nothing.
+Strictness belongs at validation, and `ExtractionResult` still rejects unknown
+fields when the response is parsed. A test asserts both properties of the wire
+schema so an SDK change fails loudly.
+
+### 2026-08-08: Measured token counts, and the preflight was wrong in both directions
+
+Measured with the free `count_tokens` endpoint, decomposed by counting the
+prompt alone and subtracting:
+
+| | Measured | Preflight guess | Error |
+|---|---|---|---|
+| Prompt `v1` alone | 860 tokens | ~700 | close |
+| `blinkit_022` image (1600x1982) | 1,110 tokens | 2,322 | **109% too high** |
+| `blinkit_026` image (1600x1624) | 1,089 tokens | 2,322 | **113% too high** |
+
+So the tile formula `ceil(w/768) * ceil(h/768) * 258` roughly doubles the real
+figure. This is the "verify before trusting these numbers" caveat from the
+preflight costing, now discharged.
+
+Output tokens went the other way. The estimate was ~450; the real calls used
+roughly 1,280 including thinking. Net effect on cost:
+
+| | Estimated | Measured |
+|---|---|---|
+| Per 5-item receipt | $0.0079 | **$0.0113** |
+| 60 receipts/month | $0.47 | **$0.68** |
+| Full 32-receipt sweep | $0.32 | **$0.36** |
+
+Still a rounding error at personal volume, so section 4.6's conclusion survives,
+but the number in the brief is now measured rather than modelled. Thinking
+tokens are the dominant term, which is worth knowing before any prompt change.
+
+### 2026-08-08: First extraction results
+
+Two receipts, the only two PNGs currently present. `gemini-3.6-flash`,
+prompt `v1`, temperature 0.
+
+| | |
+|---|---|
+| Exact field match | 2/2 |
+| Grand total correct | 2/2 |
+| Accepted by the gate | 2/2 |
+| Passed the MRP cross-check | 2/2 |
+| Total spend | $0.0227 |
+
+Every field matched, including the struck-through prices, which is the section
+24.5 failure mode. Separately, a text-only probe with a non-receipt input
+returned `is_receipt: false` with a sensible rejection reason, so the invariant
+11 safeguard works on a live model and not just in tests.
+
+**D2: no evidence of a derived total in this run.** No receipt had wrong items
+while still balancing. This is weak evidence on two samples, and it is not
+settled until the other 30 images exist. Re-check on every prompt change.
 
 ### Which Gemini model, given the brief's price is stale (resolved: `gemini-3.6-flash`)
 

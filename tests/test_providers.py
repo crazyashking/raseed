@@ -34,6 +34,7 @@ from raseed.extraction.providers.base import (
 from raseed.extraction.providers.gemini import (
     SYSTEM_INSTRUCTION,
     GeminiProvider,
+    _response_schema,
     _translate,
     _usage,
 )
@@ -59,11 +60,16 @@ def an_extraction(name: str = "blinkit_001") -> ExtractionResult:
 # ---------------------------------------------------------------------------
 
 
-def test_a_receipt_costs_what_the_preflight_said() -> None:
-    """2,322 image tokens plus ~700 of prompt, ~450 out, on gemini-3.6-flash."""
-    micros = cost_micros("gemini-3.6-flash", input_tokens=3022, output_tokens=450)
-    assert micros == 3022 * 15 // 10 + 450 * 75 // 10
-    assert 7_000 <= micros <= 8_500
+def test_a_receipt_costs_what_the_first_live_run_measured() -> None:
+    """Measured on 2026-08-08, not estimated.
+
+    A 5-item receipt is about 1,100 image tokens plus 860 for prompt v1, and
+    roughly 1,280 out including thinking. That came to $0.0126 on the real call.
+    The preflight tile arithmetic had guessed 2,322 image tokens, which was 109%
+    too high, and had guessed the output far too low.
+    """
+    micros = cost_micros("gemini-3.6-flash", input_tokens=1970, output_tokens=1280)
+    assert 11_000 <= micros <= 13_500
 
 
 def test_cost_is_always_an_integer_and_never_a_float() -> None:
@@ -293,8 +299,66 @@ def test_the_schema_constrains_the_output() -> None:
     client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     config = client.models.calls[0]["config"]
-    assert config.response_schema is ExtractionResult
     assert config.response_mime_type == "application/json"
+    assert isinstance(config.response_schema, types.Schema)
+
+
+def test_the_wire_schema_carries_no_additional_properties() -> None:
+    """The Gemini API rejects the field with a 400. Found on the first live call.
+
+    Passing `ExtractionResult` directly to `response_schema` looks correct and
+    converts cleanly offline, which is exactly why this needs a test.
+    """
+    schema = _response_schema()
+
+    def walk(node: types.Schema) -> None:
+        assert node.additional_properties is None
+        for child in (node.properties or {}).values():
+            walk(child)
+        if node.items is not None:
+            walk(node.items)
+        for child in node.any_of or ():
+            walk(child)
+
+    walk(schema)
+
+
+def test_the_wire_schema_pins_field_order_everywhere() -> None:
+    """Brief 21.2 is only real if the decoder is told the order."""
+    schema = _response_schema()
+    assert schema.property_ordering is not None
+    assert schema.property_ordering[:3] == [
+        "is_receipt",
+        "receipt_confidence",
+        "rejection_reason",
+    ]
+
+    line_items = (schema.properties or {})["line_items"].items
+    assert line_items is not None
+    assert line_items.property_ordering is not None
+    assert line_items.property_ordering.index("mrp_minor") < line_items.property_ordering.index(
+        "line_total_minor"
+    )
+
+
+def test_the_wire_schema_resolved_the_nested_models() -> None:
+    """Pydantic emits $defs and $ref. An unresolved ref would decode to nothing."""
+    line_items = (_response_schema().properties or {})["line_items"].items
+    assert line_items is not None
+    assert set(line_items.properties or {}) == {
+        "raw_name",
+        "quantity_text",
+        "mrp_minor",
+        "line_total_minor",
+    }
+
+
+def test_strictness_still_applies_when_the_response_is_validated() -> None:
+    """Dropping additional_properties from the wire schema weakens nothing."""
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        ExtractionResult.model_validate(
+            {"is_receipt": True, "receipt_confidence": 1.0, "surprise": 1}
+        )
 
 
 def test_the_prompt_comes_before_the_images() -> None:
