@@ -50,7 +50,21 @@ py -3 -m venv .venv
 copy .env.example .env
 ```
 
-Then fill in `.env`. It is gitignored.
+Then fill in `.env`. It is gitignored. You need a bot token from
+[@BotFather](https://t.me/BotFather), your **numeric** Telegram user ID from
+[@userinfobot](https://t.me/userinfobot), and a paid-tier Gemini API key.
+
+`TELEGRAM_ALLOWED_USER_IDS` is a whitelist and an empty one admits nobody, so
+the bot refuses to start until it is set.
+
+Run the migrations, then the bot:
+
+```
+.venv\Scripts\python -m alembic upgrade head
+.venv\Scripts\python run.py
+```
+
+The checks:
 
 ```
 .venv\Scripts\python -m pytest

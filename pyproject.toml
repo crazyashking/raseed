@@ -21,6 +21,12 @@ dependencies = [
     "rapidfuzz==3.14.5",
     "SQLAlchemy==2.0.51",
     "tenacity==9.1.4",
+    # Section 23.1 lists `zoneinfo` as stdlib needing no install. That is true
+    # on Linux and macOS, which ship an IANA database, and false on Windows,
+    # which ships none: `zoneinfo` there resolves nothing at all, not even UTC.
+    # Invariant 6 buckets on merchant-local dates, so the database is not
+    # optional. Approved by Ashrit on 2026-08-08. See docs/DECISIONS.md.
+    "tzdata==2026.3",
 ]
 
 [project.optional-dependencies]

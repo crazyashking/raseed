@@ -725,6 +725,105 @@ count gets measured at commit 6 before a single paid call is made.
 **Resolved 2026-08-08:** Ashrit chose option 1. `GEMINI_MODEL=gemini-3.6-flash`
 is in `.env.example`.
 
+### 2026-08-08: `tzdata` installed, an allowlist gap found by reality
+
+Seventeen flow tests failed with `ZoneInfoNotFoundError` on a zone name that is
+certainly valid. The cause is not a typo: **Windows ships no IANA timezone
+database.** `zoneinfo.TZPATH` was empty, `available_timezones()` returned zero
+entries, and `ZoneInfo("UTC")` itself raised.
+
+Section 23.1 lists `zoneinfo` as stdlib requiring no install. That is true on
+Linux and macOS and false on Windows, where the stdlib module exists but has
+nothing to read. Invariant 6 buckets every period query on the merchant-local
+calendar date, so this is not optional.
+
+`tzdata` is not on the allowlist, so per invariant 12 work stopped and Ashrit
+was asked before anything was installed. **He approved it.** `tzdata==2026.3` is
+now in `pyproject.toml` and hash-locked; 598 zones resolve.
+
+`src/raseed/timezones.py` wraps `ZoneInfo` so the failure is legible if this
+recurs on a fresh machine: it distinguishes "no database at all" from "no such
+zone" and names the fix. Treat this as an addition to section 23.1 rather than a
+deviation from it.
+
+### 2026-08-08: The flow is transport-agnostic and Telegram is a thin shell
+
+Every decision about a receipt lives in `adapters/flow.py`, which knows nothing
+about Telegram. `adapters/telegram.py` translates results into messages and
+buttons and does nothing else.
+
+The reason is testability, not future-proofing. `test_flow.py` reaches every
+branch including the daily cap, expiry, Class 1, Class 2 and the duplicate paths
+with no bot token, no network and no API key. Brief section 2 also names
+WhatsApp as a later transport, which this shape allows, but that is a side
+effect.
+
+### 2026-08-08: The order of checks in `submit_image` is the design
+
+Cheapest and most protective first:
+
+1. Daily cost cap, before anything is downloaded or paid for (16.6)
+2. Dedupe on the image hash, which is free (3.6 as revised by 24.4)
+3. Extraction, the only step that spends money
+4. `is_receipt`, before a single line item is read (invariant 11)
+5. The reconciliation gate
+6. The user, who confirms before anything commits (3.4)
+
+Putting the cap first means a runaway loop costs nothing. Putting the hash check
+second means the common accidental resend never reaches the model.
+
+### 2026-08-08: Pending state is keyed by `(chat_id, message_id)` and lives in memory
+
+Brief 16.4 names the bug: three receipts in flight, one global "pending"
+variable, and confirming the third commits the first. The key travels in the
+inline keyboard's `callback_data`, which Telegram caps at 64 bytes. The encoding
+is `action|chat_id|message_id`; a test asserts the worst realistic case (a
+supergroup ID and a nine-digit message ID) fits, and oversized data raises rather
+than truncating, because a silently truncated key would confirm the wrong
+receipt.
+
+The store is in memory. A restart loses pending confirmations, which is
+acceptable because nothing has been committed yet. It is **not** acceptable to
+leak the images those entries pointed at, so `ImageStore.sweep` runs at startup
+and `expire_stale` deletes on TTL. Invariant 7 does not stop applying because
+the process died.
+
+### 2026-08-08: A Class 2 receipt has no Confirm button at all
+
+Rather than showing Confirm and refusing it, the keyboard for an unreconciled
+Class 2 offers only "Log the gap" and "Discard". A button that exists and does
+nothing teaches the user to distrust the buttons. Once the gap is accepted the
+normal keyboard returns and the difference is recorded as an
+`unaccounted_adjustment`, per brief 3.3.
+
+### 2026-08-08: The whitelist fails closed, and a stranger gets silence
+
+`TELEGRAM_ALLOWED_USER_IDS` is a whitelist of numeric IDs and **an empty
+whitelist admits nobody.** A misconfigured `.env` therefore locks the owner out
+rather than opening the ledger to anyone who finds the bot.
+
+An unlisted sender gets no reply at all, not even a refusal, because any reply
+confirms the bot exists to whoever is probing it. `__main__` refuses to start
+with an empty whitelist, so failing closed does not silently look like a broken
+bot.
+
+### 2026-08-08: The daily cap is parsed through `Decimal`, never `float`
+
+`DAILY_COST_LIMIT_USD` is written by a human in dollars and held as integer
+micro-dollars, because it is compared against summed `cost_micros_usd`. A value
+finer than a micro-dollar is **refused, not rounded**: rounding a budget is a
+decision, and it is not the config parser's to make. Invariant 1 governs the
+ledger, but a budget that drifts by a rounding error is no better than a float
+rupee.
+
+### 2026-08-08: `python -m raseed` does not create tables
+
+The entrypoint wires config, engine, provider, flow and bot together and runs
+polling. It seeds categories via `db/seed.py`, which is idempotent, but it never
+calls `create_all`. Alembic owns the schema. A `create_all` that quietly
+disagreed with the migration history would be a data bug that only surfaced at
+the first migration, which is exactly the wrong time.
+
 ---
 
 ## Still open
