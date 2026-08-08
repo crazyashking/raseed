@@ -427,6 +427,90 @@ the GST rounding it was added for.
 `blinkit_000`, the redacted real receipt, was swept separately and excluded from
 the count. It also reconciles at delta 0 and passes the MRP cross-check.
 
+### 2026-08-08: Seven tables, and why `transaction_adjustments` exists
+
+`users`, `merchants`, `categories`, `raw_extractions`, `transactions`,
+`transaction_line_items`, `transaction_adjustments`.
+
+The last one is the only addition beyond what the brief names directly. Charges,
+taxes and order-level discounts have to be queryable, otherwise the ledger cannot
+reproduce its own grand total without reparsing
+`raw_extractions.response_json`, and both `/export` (section 16.1) and every
+summary would depend on a text blob. One table with a `kind` enum rather than
+three near-identical tables. A test asserts that the stored parts still satisfy
+the reconciliation equation for every fixture.
+
+### 2026-08-08: The `users` table holds no Telegram ID
+
+`users` is `id`, `created_at`, `deleted_at`, and nothing else. Access control
+lives in `TELEGRAM_ALLOWED_USER_IDS` in the environment, so no external account
+identifier ever lands in the database. A Telegram numeric ID is a pseudonymous
+handle for a real person, and invariant 3 is easier to keep absolutely than
+approximately.
+
+When multi-user arrives, the Telegram-to-user mapping becomes its own table and
+this one does not change. `user_id` is already on every table, which was the
+expensive part.
+
+### 2026-08-08: Money columns on `transactions` are deliberately unconstrained
+
+The extraction schema forbids negative amounts, because a printed receipt cannot
+show one. The ledger must allow them, because section 16.8 models a refund as its
+own row with a negative `grand_total_minor` and a `related_transaction_id`
+pointing at the original. The original is never edited, so the append-only
+property survives and category totals net out with no special-case logic.
+
+`CHECK` constraints are therefore applied only where they are unambiguously
+right: `mrp_minor >= 0`, `amount_minor >= 0` on adjustments, and currency being
+three uppercase characters.
+
+### 2026-08-08: Cost is stored in integer micro-dollars
+
+A receipt costs about $0.0079. In cents that rounds to zero, and a float would
+violate invariant 1. `raw_extractions.cost_micros_usd` is an integer count of
+millionths of a dollar, so a receipt is 7,900 and the daily cost cap in section
+16.6 stays exact.
+
+### 2026-08-08: Primary keys are UUID4 text, not autoincrementing integers
+
+Row IDs travel in Telegram inline-keyboard callback data. Sequential integers
+would let one user guess another user's row IDs the moment this stops being
+single-user, and the confirm flow in 16.4 keys pending state by ID.
+
+### 2026-08-08: SQLite foreign keys are enforced explicitly
+
+SQLite ignores foreign keys unless `PRAGMA foreign_keys=ON` is issued per
+connection. Without it, a refund pointing at a transaction that does not exist
+would insert happily and the chain in 16.8 would rot silently. `db/engine.py`
+attaches the pragma on connect, along with `journal_mode=WAL` for the durability
+reason in 16.1. A test asserts the pragma is actually live rather than assuming
+it.
+
+### 2026-08-08: `alembic.ini` carries no connection string
+
+`sqlalchemy.url` is left blank and `alembic/env.py` reads `DATABASE_URL` from the
+environment. No database path is committed, and the live ledger cannot be
+targeted by accident from a checked-in file. `env.py` deliberately does not use
+`raseed.config.Settings`, which would demand a bot token and an API key that a
+migration has no use for.
+
+`render_as_batch=True` is set because SQLite cannot `ALTER` most things in place;
+without it any future column change silently fails to generate.
+
+### 2026-08-08: Categories are seeded at bootstrap, not in the migration
+
+A category needs a `user_id`, and no user exists at migration time. So
+`db/seed.py` runs on first connect instead and is idempotent. It never renames an
+existing category, because `display_name` is mutable by design and only the slug
+is stable.
+
+### 2026-08-08: A test asserts the migration matches the models
+
+`test_the_migration_matches_the_models` runs `alembic upgrade head` against a
+temporary SQLite file and compares the resulting tables and columns to
+`Base.metadata`. A hand-edited migration that drifts from `models.py` is a silent
+data bug, and this is the cheapest possible guard against it.
+
 ---
 
 ## Resolved decisions

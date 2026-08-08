@@ -7,10 +7,16 @@ is gitignored and therefore absent on a fresh clone.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.orm import Session
+
+from raseed.db.engine import create_engine
+from raseed.db.models import Base, User
+from raseed.db.seed import bootstrap
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
@@ -50,3 +56,26 @@ def fixture_name(request: pytest.FixtureRequest) -> str:
     """Parametrised over every committed fixture."""
     name: str = request.param
     return name
+
+
+@pytest.fixture
+def session() -> Iterator[Session]:
+    """An in-memory ledger with the schema created and nothing seeded.
+
+    Built from `Base.metadata` rather than by running Alembic, so a schema test
+    failure points at the models. `test_models.py` separately asserts that the
+    migration produces the same shape.
+    """
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        yield db
+    engine.dispose()
+
+
+@pytest.fixture
+def seeded(session: Session) -> tuple[Session, User]:
+    """A ledger with the single user and the seed categories in place."""
+    user = bootstrap(session)
+    session.commit()
+    return session, user
