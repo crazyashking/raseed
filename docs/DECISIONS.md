@@ -511,6 +511,78 @@ temporary SQLite file and compares the resulting tables and columns to
 `Base.metadata`. A hand-edited migration that drifts from `models.py` is a silent
 data bug, and this is the cheapest possible guard against it.
 
+### 2026-08-08: Section 3.10 drafted and accepted, image path only
+
+Ashrit ruled out the PDF text-layer path: most PDFs will be scans or exported
+images anyway, so the router is designed around the image path and everything
+else is made to look like one. Full text at
+`docs/proposals/3.10-ingestion-router.md`. He confirmed `MAX_PDF_PAGES = 5` and
+accepted the other four open questions as drafted.
+
+Consequence: **`pdfplumber` is installed and unused in v0.** It stays on the
+allowlist so the branch can be added later without a dependency conversation.
+
+### 2026-08-08: The first boundary drawn on an invariant
+
+Invariant 9 says "no image editing, upscaling, or enhancement anywhere in the
+pipeline", and it is written absolutely. Rasterizing a PDF page creates pixels
+that did not exist as pixels, and decoding HEIC produces different bytes for the
+same picture. Neither is editing, but the invariant does not say so.
+
+**Accepted rule: decoding and rendering are permitted, altering is not.** A
+transform is allowed only if it is deterministic, lossless with respect to
+content, and produces a visually identical result on every run. Rasterizing at
+fixed DPI and transcoding a container qualify. Sharpening, straightening,
+denoising and upscaling do not.
+
+The text of invariant 9 in `CLAUDE.md` is unchanged. This records where its edge
+sits, which is a different thing from changing it.
+
+### 2026-08-08: Gemini schema conversion verified, not assumed
+
+The whole value of section 21.2 rests on `is_receipt` being generated before any
+line item. That only holds if the field order survives into the provider's
+constrained decoder.
+
+Checked against the installed `google-genai` 2.17.0 before writing the provider:
+`ExtractionResult` converts cleanly, `additional_properties: false` survives, the
+nullable unions become `nullable: true` rather than failing, and the SDK emits
+`property_ordering` with `is_receipt` first. This was the largest unverified
+assumption in the design and it holds.
+
+### 2026-08-08: Cost is priced from a dated table, and an unknown model refuses
+
+`extraction/pricing.py` carries `RATES_CHECKED_ON = 2026-08-08` alongside the
+rates. Pricing a model with no entry raises `UnknownModelError` rather than
+returning zero, because a silently wrong cost defeats the daily cap in 16.6.
+Cost arithmetic rounds up, so the recorded figure is never lower than the real
+one and the cap trips early rather than late.
+
+### 2026-08-08: Prompts are versioned files, never edited in place
+
+`extraction/prompts/v1.md`, loaded by version, with the version stored on every
+`raw_extractions` row. A released version is never edited: a new one is added.
+Old rows reference `v1` and that reference has to keep meaning what it meant, or
+the audit trail is fiction. A test asserts the prompt still states the four rules
+that matter, so a rewrite cannot quietly drop one.
+
+### 2026-08-08: The error taxonomy splits on retryability, not on severity
+
+`ProviderTransientError` (429, 5xx, timeouts) is retried three times with
+exponential backoff per 16.5. `ProviderResponseError` is not, because retrying an
+identical request against a temperature-zero decoder gets the same answer and
+spends the rate limit. `ProviderBlockedError` is separate again, because the user
+needs a different message and no amount of retrying helps.
+
+### 2026-08-08: Nothing in the test suite spends money
+
+The Gemini client is injected, so all 55 provider tests run against a fake with
+no key and no network. The only thing that can spend is
+`tools/eval_extraction.py`, which is never run by pytest, refuses to start
+without `GEMINI_API_KEY`, and has a `--dry-run` mode that calls the free
+`count_tokens` endpoint and prints the projected cost before anything is
+authorised.
+
 ---
 
 ## Resolved decisions

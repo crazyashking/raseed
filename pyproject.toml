@@ -75,6 +75,11 @@ ignore = [
     "PLR2004", # magic values are fine in tests and money constants
 ]
 
+[tool.ruff.lint.pylint]
+# The provider constructors take a handful of keyword-only options with
+# defaults, which is the readable shape for them. Five is too tight.
+max-args = 8
+
 [tool.ruff.lint.per-file-ignores]
 "tools/*" = ["T20"]     # the render and lock scripts are CLIs, they print
 "tests/*" = ["ARG001"]  # fixtures arrive as unused-looking arguments
@@ -98,6 +103,10 @@ warn_unreachable = true
 disallow_any_generics = true
 no_implicit_reexport = true
 show_error_codes = true
+
+# tools/render_receipts.py is Ashrit's, kept byte for byte as written, and it
+# imports jinja2 and playwright which are deliberately not installed (23.4).
+exclude = ["tools/render_receipts\\.py$"]
 
 [[tool.mypy.overrides]]
 module = ["pdfplumber.*", "pypdfium2.*"]
