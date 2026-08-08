@@ -1,0 +1,9 @@
+# Development is on Windows, deployment is Linux. Normalise to LF in the repo so
+# diffs stay clean across both.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.db binary

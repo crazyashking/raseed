@@ -1,0 +1,37 @@
+# Receipt data. Images can contain PII and this repo is public.
+# Nothing under data/ is ever committed, including the redacted real receipt
+# data/eval/blinkit_000.png.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

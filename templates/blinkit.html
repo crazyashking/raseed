@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Receipt</title>
+<style>
+  body { margin: 0; padding: 0; background: #f4f4f4;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: #1c1c1c; }
+  .receipt { width: 800px; background: #f4f4f4; }
+
+  .metadata-header { background:#fff; padding:10px 20px; font-size:12px; color:#888;
+                     border-bottom:1px solid #f0f0f0; }
+
+  .header { display:flex; align-items:center; padding:20px; background:#fff; }
+  .icon-btn { width:40px; height:40px; border-radius:50%; background:#fff;
+              border:1px solid #e0e0e0; display:flex; align-items:center;
+              justify-content:center; font-size:20px; color:#333; }
+  .header-title { font-size:18px; font-weight:600; margin-left:20px; flex-grow:1; color:#1c1c1c; }
+
+  .item-list { background:#fff; padding:0 20px; }
+  .item-row { display:flex; align-items:center; padding:20px 0; border-bottom:1px solid #f9f9f9; }
+  .item-row:last-child { border-bottom:none; }
+  .item-img { width:64px; height:64px; border-radius:12px; background:#e8e8e8;
+              margin-right:20px; flex-shrink:0; }
+  .item-info { flex-grow:1; display:flex; flex-direction:column; }
+  .item-name { font-size:16px; font-weight:500; margin-bottom:8px; color:#222; }
+  .item-qty { font-size:14px; color:#7a7a7a; }
+  .item-price { font-size:16px; text-align:right; white-space:nowrap; }
+  .mrp-strike { color:#8a8a8a; text-decoration:line-through; font-weight:400; margin-right:6px; }
+  .paid { font-weight:700; color:#1c1c1c; }
+
+  .rating-banner { background:#fff; margin-top:12px; padding:16px 20px;
+                   display:flex; align-items:center; }
+  .star-icon { width:40px; height:40px; background:#fffbf0; border:1px solid #ffecb3;
+               border-radius:8px; display:flex; align-items:center; justify-content:center;
+               font-size:20px; margin-right:16px; }
+  .rating-text { font-size:16px; font-weight:700; flex-grow:1; }
+  .rate-btn { background:#318a2c; color:#fff; border:none; padding:10px 20px;
+              border-radius:8px; font-weight:600; font-size:14px; }
+
+  .bill-details { background:#fff; margin-top:12px; padding:24px 20px 32px; }
+  .bill-title { font-size:18px; font-weight:700; margin-bottom:20px; }
+  .bill-row { display:flex; justify-content:space-between; margin-bottom:12px;
+              font-size:15px; color:#555; }
+  .bill-row.discount { color:#3b82f6; }
+  .bill-row.total { font-weight:700; font-size:16px; color:#000; margin-top:16px;
+                    margin-bottom:0; padding-top:16px; border-top:1px dashed #e0e0e0; }
+</style>
+</head>
+<body>
+
+{#
+  Money renders as whole rupees when there are no paise, matching the real receipt.
+  A template that always prints .00 produces synthetic images that do not look like
+  the real thing.
+#}
+{% macro rs(minor) -%}
+₹{% if minor % 100 == 0 %}{{ minor // 100 }}{% else %}{{ "%.2f"|format(minor / 100) }}{% endif %}
+{%- endmacro %}
+
+{#
+  MRP total is derived from the line items, never from the discounts array.
+  When mrp_minor is null the item was not discounted, so its MRP equals what was paid.
+#}
+{% set ns = namespace(mrp_total=0) %}
+{% for item in line_items %}
+  {% set ns.mrp_total = ns.mrp_total + (item.mrp_minor if item.mrp_minor else item.line_total_minor) %}
+{% endfor %}
+
+{% set item_total_minor     = line_items | sum(attribute='line_total_minor') %}
+{% set product_discount     = ns.mrp_total - item_total_minor %}
+{% set order_discount_total = discounts | sum(attribute='amount_minor') %}
+
+<div class="receipt">
+
+  {# Default OFF. The real screen shows none of these, and printing them makes the
+     synthetic receipts easier than reality, which inflates your accuracy number.
+     Pass show_metadata=true only when you deliberately want that variant. #}
+  {% if show_metadata %}
+  <div class="metadata-header">
+    Merchant: {{ merchant_name or 'N/A' }} |
+    Order ID: {{ order_id or 'N/A' }} |
+    Date: {{ order_datetime_local or 'N/A' }}
+  </div>
+  {% endif %}
+
+  <div class="header">
+    <div class="icon-btn">&lt;</div>
+    <div class="header-title">Items in this order</div>
+    <div class="icon-btn">&#128465;</div>
+  </div>
+
+  <div class="item-list">
+    {% for item in line_items %}
+    <div class="item-row">
+      <div class="item-img"></div>
+      <div class="item-info">
+        <div class="item-name">{{ item.raw_name }}</div>
+        <div class="item-qty">{{ item.quantity_text }}</div>
+      </div>
+      <div class="item-price">
+        {% if item.mrp_minor and item.mrp_minor != item.line_total_minor %}
+          <span class="mrp-strike">{{ rs(item.mrp_minor) }}</span>
+        {% endif %}
+        <span class="paid">{{ rs(item.line_total_minor) }}</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="rating-banner">
+    <div class="star-icon">&#11088;</div>
+    <div class="rating-text">How were your ordered items?</div>
+    <button class="rate-btn">Rate now</button>
+  </div>
+
+  <div class="bill-details">
+    <div class="bill-title">Bill details</div>
+
+    {# MRP and Product discount only appear when items were actually discounted. #}
+    {% if product_discount > 0 %}
+    <div class="bill-row">
+      <span>MRP</span><span>{{ rs(ns.mrp_total) }}</span>
+    </div>
+    <div class="bill-row discount">
+      <span>Product discount</span><span>-{{ rs(product_discount) }}</span>
+    </div>
+    {% endif %}
+
+    <div class="bill-row">
+      <span>Item total</span><span>{{ rs(item_total_minor) }}</span>
+    </div>
+
+    {% for charge in charges %}
+    <div class="bill-row">
+      <span>{{ charge.label }}</span>
+      {% if charge.amount_minor == 0 %}
+        <span>FREE</span>
+      {% else %}
+        <span>+{{ rs(charge.amount_minor) }}</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    {# Order-level discounts (coupons, wallet credit) sit BELOW charges, because they
+       apply after the item total. Product discounts are already inside the line prices
+       and never appear here. #}
+    {% for discount in discounts %}
+    <div class="bill-row discount">
+      <span>{{ discount.label }}</span><span>-{{ rs(discount.amount_minor) }}</span>
+    </div>
+    {% endfor %}
+
+    {% for tax in taxes %}
+    <div class="bill-row">
+      <span>{{ tax.label }}</span><span>+{{ rs(tax.amount_minor) }}</span>
+    </div>
+    {% endfor %}
+
+    <div class="bill-row total">
+      <span>Bill total</span><span>{{ rs(grand_total_minor) }}</span>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

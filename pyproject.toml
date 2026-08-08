@@ -1,0 +1,115 @@
+[project]
+name = "raseed"
+version = "0.1.0"
+description = "A personal spend ledger fed by receipt images, over Telegram."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+
+# Every entry below is on the allowlist in section 23.1 of the brief. Adding
+# anything else is a conversation, not an edit. Versions are exact per section
+# 23.2; the full transitive set is hash-locked in requirements.txt.
+dependencies = [
+    "alembic==1.19.1",
+    "google-genai==2.17.0",
+    "pdfplumber==0.11.10",
+    "pydantic==2.13.4",
+    "pypdfium2==5.12.1",
+    "python-dotenv==1.2.2",
+    "python-telegram-bot==22.8",
+    "PyYAML==6.0.3",
+    "rapidfuzz==3.14.5",
+    "SQLAlchemy==2.0.51",
+    "tenacity==9.1.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==2.3.0",
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "ruff==0.16.2",
+]
+# Jinja2 and playwright are allowlisted and belong to tools/render_receipts.py,
+# which regenerates the eval images. They are deliberately not installed and so
+# not pinned yet, per section 23.4: pulling a browser binary is an explicit act,
+# not a side effect. Pin them here when that install actually happens.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "N",    # pep8 naming
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "A",    # builtin shadowing
+    "C4",   # comprehensions
+    "DTZ",  # naive datetime, guards invariant 6
+    "T20",  # no print in library code
+    "SIM",  # simplify
+    "RET",  # return consistency
+    "ARG",  # unused arguments
+    "PTH",  # pathlib over os.path, this repo runs on Windows
+    "PL",   # pylint subset
+    "RUF",
+]
+ignore = [
+    "E501",    # the formatter owns line length
+    "PLR2004", # magic values are fine in tests and money constants
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tools/*" = ["T20"]     # the render and lock scripts are CLIs, they print
+"tests/*" = ["ARG001"]  # fixtures arrive as unused-looking arguments
+
+[tool.ruff.format]
+docstring-code-format = true
+# render_receipts.py is Ashrit's, it produced the eval set, and it is left byte
+# for byte as written. It passes `ruff check`; only the formatter disagrees with
+# one line continuation.
+exclude = ["tools/render_receipts.py"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["raseed"]
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+no_implicit_reexport = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["pdfplumber.*", "pypdfium2.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+# src on the path instead of `pip install -e .`, which would pull setuptools
+# into the venv as a side effect. See docs/DECISIONS.md.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
