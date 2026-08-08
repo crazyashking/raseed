@@ -1,0 +1,168 @@
+# The Hinglish grocery lexicon. Brief section 4.5.
+#
+# Checked BEFORE any API call. Most of Stage 2 should never touch a model.
+#
+# ---------------------------------------------------------------------------
+# On `category`, and a contradiction inside the brief
+# ---------------------------------------------------------------------------
+# Section 4.5's example uses `vegetables`, `dairy_eggs` and `staples`. Those are
+# from the twelve-domain taxonomy that section 3.8 explicitly retracts:
+#
+#   "[CORRECTED: I overbuilt this] ... Starting taxonomy, which is only what you
+#    actually named: Groceries, Food & Dining, Drinks, Entertainment,
+#    Uncategorized. No sub-categories at launch."
+#
+# 3.8 is dated later and corrects 4.5, so `category` here uses the five real
+# slugs. The finer meaning is not lost: it moves to `canonical`, which is where
+# it belongs. When there is enough grocery volume to split Groceries into
+# Vegetables and Dairy (3.8 says to wait for that), the canonical names are
+# already sitting here and Stage 2 re-runs over stored extractions for free.
+#
+# ---------------------------------------------------------------------------
+# On spelling
+# ---------------------------------------------------------------------------
+# Matching is FUZZY, never exact. Spelling is inconsistent across merchants and
+# across orders: bhindi/bhendi, dahi/dhai, paneer/panner, jeera/zeera. Do not
+# add every misspelling here; that is what the fuzzy threshold is for. Add a
+# `variants` entry only when a spelling is far enough away that fuzzy misses it,
+# such as a different word for the same thing.
+#
+# ---------------------------------------------------------------------------
+# How this file grows
+# ---------------------------------------------------------------------------
+# Not by guessing. Every unmatched token lands in `lexicon_misses`. Once a week,
+# read that table, add the real ones here, and re-run Stage 2. The brief's v0.2
+# claim that "300 to 400 terms" covers most orders was invented and retracted;
+# the real number comes from the miss log after a month of actual receipts.
+
+version: 1
+
+terms:
+  # --- Vegetables ---------------------------------------------------------
+  bhindi: { canonical: okra, category: groceries }
+  baingan: { canonical: eggplant, category: groceries, variants: [brinjal] }
+  lauki: { canonical: bottle_gourd, category: groceries, variants: [ghiya] }
+  tori: { canonical: ridge_gourd, category: groceries, variants: [turai] }
+  karela: { canonical: bitter_gourd, category: groceries }
+  methi: { canonical: fenugreek_leaves, category: groceries }
+  palak: { canonical: spinach, category: groceries }
+  dhaniya: { canonical: coriander, category: groceries, variants: [kothmir] }
+  pudina: { canonical: mint, category: groceries }
+  gobi: { canonical: cauliflower, category: groceries, variants: [phool gobi] }
+  patta_gobi: { canonical: cabbage, category: groceries }
+  matar: { canonical: green_peas, category: groceries }
+  shimla_mirch: { canonical: bell_pepper, category: groceries }
+  hari_mirch: { canonical: green_chilli, category: groceries }
+  adrak: { canonical: ginger, category: groceries }
+  lehsun: { canonical: garlic, category: groceries }
+  pyaz: { canonical: onion, category: groceries, variants: [kanda] }
+  aloo: { canonical: potato, category: groceries }
+  tamatar: { canonical: tomato, category: groceries }
+  gajar: { canonical: carrot, category: groceries }
+  kheera: { canonical: cucumber, category: groceries }
+  nimbu: { canonical: lemon, category: groceries }
+  arbi: { canonical: taro, category: groceries }
+  shakarkandi: { canonical: sweet_potato, category: groceries }
+  kaddu: { canonical: pumpkin, category: groceries }
+
+  # --- Dairy and eggs -----------------------------------------------------
+  dahi: { canonical: yogurt, category: groceries, variants: [curd, dhai] }
+  paneer: { canonical: paneer, category: groceries }
+  ghee: { canonical: clarified_butter, category: groceries }
+  makhan: { canonical: butter, category: groceries }
+  malai: { canonical: cream, category: groceries }
+  chaas: { canonical: buttermilk, category: drinks }
+  lassi: { canonical: lassi, category: drinks }
+  doodh: { canonical: milk, category: groceries }
+
+  # --- Staples, flours and lentils ----------------------------------------
+  atta: { canonical: wheat_flour, category: groceries }
+  maida: { canonical: refined_flour, category: groceries }
+  besan: { canonical: gram_flour, category: groceries }
+  sooji: { canonical: semolina, category: groceries, variants: [rava] }
+  poha: { canonical: flattened_rice, category: groceries }
+  chawal: { canonical: rice, category: groceries }
+  basmati: { canonical: basmati_rice, category: groceries }
+  toor_dal: { canonical: pigeon_pea, category: groceries, variants: [arhar dal, tur dal] }
+  moong_dal: { canonical: mung_bean, category: groceries }
+  masoor_dal: { canonical: red_lentil, category: groceries }
+  chana_dal: { canonical: split_chickpea, category: groceries }
+  urad_dal: { canonical: black_gram, category: groceries }
+  rajma: { canonical: kidney_bean, category: groceries }
+  chana: { canonical: chickpea, category: groceries, variants: [chhole, chole, kabuli chana] }
+  makhana: { canonical: fox_nut, category: groceries }
+  sabudana: { canonical: tapioca_pearl, category: groceries }
+
+  # --- Spices -------------------------------------------------------------
+  haldi: { canonical: turmeric, category: groceries }
+  jeera: { canonical: cumin, category: groceries, variants: [zeera] }
+  rai: { canonical: mustard_seed, category: groceries, variants: [sarson] }
+  ajwain: { canonical: carom_seed, category: groceries }
+  hing: { canonical: asafoetida, category: groceries }
+  elaichi: { canonical: cardamom, category: groceries }
+  dalchini: { canonical: cinnamon, category: groceries }
+  laung: { canonical: clove, category: groceries }
+  kali_mirch: { canonical: black_pepper, category: groceries }
+  garam_masala: { canonical: garam_masala, category: groceries }
+  imli: { canonical: tamarind, category: groceries }
+  gud: { canonical: jaggery, category: groceries, variants: [gur] }
+  namak: { canonical: salt, category: groceries }
+  cheeni: { canonical: sugar, category: groceries, variants: [shakkar] }
+  tel: { canonical: cooking_oil, category: groceries }
+  sarson_ka_tel: { canonical: mustard_oil, category: groceries }
+
+  # --- Snacks and prepared food -------------------------------------------
+  namkeen: { canonical: savoury_snack_mix, category: groceries }
+  bhujia: { canonical: bhujia, category: groceries }
+  papad: { canonical: papad, category: groceries }
+  achar: { canonical: pickle, category: groceries }
+  biscuit: { canonical: biscuit, category: groceries }
+  roti: { canonical: flatbread, category: food-and-dining, variants: [chapati, phulka] }
+  paratha: { canonical: paratha, category: food-and-dining }
+  samosa: { canonical: samosa, category: food-and-dining }
+  idli: { canonical: idli, category: food-and-dining }
+  dosa: { canonical: dosa, category: food-and-dining }
+  biryani: { canonical: biryani, category: food-and-dining }
+  thali: { canonical: thali, category: food-and-dining }
+
+  # --- English-primary items -----------------------------------------------
+  # Not Hinglish, and here for a measured reason. The first twelve real line
+  # items off Blinkit and Zepto were mostly English ("Green Cucumber", "Fresh
+  # White Eggs", "English Oven Milk Bread"), and a Hinglish-only lexicon matched
+  # 3 of them. The Hinglish entries above now also index their `canonical`
+  # spelling, which catches cucumber, carrot, milk and rice. These are the items
+  # with no Hindi entry to hang off.
+  banana: { canonical: banana, category: groceries, variants: [kela] }
+  bread: { canonical: bread, category: groceries, variants: [double roti] }
+  egg: { canonical: egg, category: groceries, variants: [eggs, anda, ande] }
+  cheese: { canonical: cheese, category: groceries }
+  popcorn: { canonical: popcorn, category: groceries }
+  apple: { canonical: apple, category: groceries, variants: [seb] }
+  orange: { canonical: orange, category: groceries, variants: [santra] }
+  mango: { canonical: mango, category: groceries, variants: [aam] }
+  grapes: { canonical: grapes, category: groceries, variants: [angoor] }
+  papaya: { canonical: papaya, category: groceries, variants: [papita] }
+  watermelon: { canonical: watermelon, category: groceries, variants: [tarbooj] }
+  chocolate: { canonical: chocolate, category: groceries }
+  chips: { canonical: potato_chips, category: groceries, variants: [wafers] }
+  noodles: { canonical: noodles, category: groceries, variants: [maggi] }
+  pasta: { canonical: pasta, category: groceries }
+  honey: { canonical: honey, category: groceries, variants: [shahad] }
+  peanut: { canonical: peanut, category: groceries, variants: [moongphali, groundnut] }
+  almond: { canonical: almond, category: groceries, variants: [badam] }
+  cashew: { canonical: cashew, category: groceries, variants: [kaju] }
+  raisin: { canonical: raisin, category: groceries, variants: [kishmish] }
+  soap: { canonical: soap, category: groceries, variants: [sabun] }
+  shampoo: { canonical: shampoo, category: groceries }
+  toothpaste: { canonical: toothpaste, category: groceries }
+  detergent: { canonical: detergent, category: groceries, variants: [surf] }
+  tissue: { canonical: tissue_paper, category: groceries }
+
+  # --- Drinks -------------------------------------------------------------
+  chai: { canonical: tea, category: drinks }
+  chai_patti: { canonical: tea_leaves, category: groceries }
+  coffee: { canonical: coffee, category: drinks }
+  nimbu_pani: { canonical: lemonade, category: drinks, variants: [shikanji] }
+  thums_up: { canonical: cola, category: drinks }
+  soda: { canonical: soda, category: drinks }
+  juice: { canonical: juice, category: drinks }

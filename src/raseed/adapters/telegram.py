@@ -25,6 +25,7 @@ from typing import Final
 
 from sqlalchemy.orm import Session, sessionmaker
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -296,6 +297,35 @@ class RaseedBot:
             return
         await message.reply_text(result.message)
 
+    # -- failure -------------------------------------------------------------
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Say something when a handler raises, instead of nothing.
+
+        Without this, python-telegram-bot logs `No error handlers are
+        registered` and the user gets silence. That happened live on
+        2026-08-08: a `/undo` then a resend hit an integrity error on confirm,
+        and the receipt simply never came back. Silence is the worst possible
+        answer, because it is indistinguishable from the bot being down.
+
+        The message deliberately says nothing about how to send the receipt.
+        Invariant 10. "Something went wrong on my end" is a statement about the
+        bot; "try sending it as a file" would be an instruction to the user.
+        """
+        log.exception("unhandled error while processing an update", exc_info=context.error)
+
+        message = getattr(update, "effective_message", None)
+        if message is None:
+            return
+        try:
+            await message.reply_text(
+                "Something went wrong on my end and I did not save that one. Nothing was changed."
+            )
+        except TelegramError:
+            # The reply itself failed. Nothing further to try, and raising here
+            # would take down the error handler as well.
+            log.exception("could not deliver the error message")
+
     # -- wiring --------------------------------------------------------------
 
     def register(self, application: Application) -> None:  # type: ignore[type-arg]
@@ -308,6 +338,7 @@ class RaseedBot:
         application.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         application.add_handler(MessageHandler(filters.Document.IMAGE, self.on_document))
         application.add_handler(CallbackQueryHandler(self.on_button))
+        application.add_error_handler(self.on_error)
 
 
 def build_application(token: str, bot: RaseedBot) -> Application:  # type: ignore[type-arg]

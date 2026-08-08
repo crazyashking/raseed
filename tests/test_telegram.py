@@ -11,6 +11,7 @@ instance and this file must not need credentials to run.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from typing import cast
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 from telegram import Update
+from telegram.error import TelegramError
+from telegram.ext import ContextTypes
 
 from conftest import as_extraction_payload
 from raseed.adapters.flow import FlowConfig, ReceiptFlow, Step
@@ -308,6 +311,76 @@ def test_an_unknown_action_is_survivable(
     key = pending_for(flow, session, user)
     result = bot.dispatch(session, "wat", key)
     assert result.step is Step.EXPIRED
+
+
+# ---------------------------------------------------------------------------
+# Failure (found live, 2026-08-08)
+# ---------------------------------------------------------------------------
+
+
+class Replier:
+    """The smallest stand-in for a message that records what it was told."""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        self.said: list[str] = []
+        self._fails = fails
+
+    async def reply_text(self, text: str, **_kwargs: object) -> None:
+        if self._fails:
+            raise TelegramError("chat not found")
+        self.said.append(text)
+
+
+def failing_update(message: Replier | None) -> object:
+    return SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=ALLOWED_ID))
+
+
+def error_context(exc: Exception) -> ContextTypes.DEFAULT_TYPE:
+    return cast("ContextTypes.DEFAULT_TYPE", SimpleNamespace(error=exc))
+
+
+def test_a_crash_gets_a_reply_instead_of_silence(bot: RaseedBot) -> None:
+    """Found live: a handler raised, nothing was registered, the user saw nothing.
+
+    Silence is the worst answer available, because it is indistinguishable from
+    the bot being down.
+    """
+    message = Replier()
+    asyncio.run(bot.on_error(failing_update(message), error_context(RuntimeError("boom"))))
+
+    assert len(message.said) == 1
+    assert "went wrong" in message.said[0].lower()
+    assert "nothing was changed" in message.said[0].lower()
+
+
+def test_the_error_message_does_not_coach_the_user(bot: RaseedBot) -> None:
+    """Invariant 10 still applies when the bot is the thing that broke."""
+    message = Replier()
+    asyncio.run(bot.on_error(failing_update(message), error_context(RuntimeError("boom"))))
+
+    lowered = message.said[0].lower()
+    for phrase in ("crop", "retake", "rotate", "as a file", "resend", "try again", "lighting"):
+        assert phrase not in lowered
+
+
+def test_an_update_with_no_message_is_survivable(bot: RaseedBot) -> None:
+    """Callback queries and channel posts may carry nothing to reply to."""
+    asyncio.run(bot.on_error(failing_update(None), error_context(RuntimeError("boom"))))
+
+
+def test_a_failure_to_deliver_the_error_does_not_raise(bot: RaseedBot) -> None:
+    """The error handler is the last line. If it raises, PTB has nowhere to go."""
+    asyncio.run(
+        bot.on_error(failing_update(Replier(fails=True)), error_context(RuntimeError("boom")))
+    )
+
+
+def test_the_error_handler_is_registered() -> None:
+    """The bug was not a missing message, it was a missing registration."""
+    source = (
+        Path(__file__).resolve().parent.parent / "src" / "raseed" / "adapters" / "telegram.py"
+    ).read_text(encoding="utf-8")
+    assert "add_error_handler(self.on_error)" in source
 
 
 def test_a_button_for_an_unknown_receipt_does_not_raise(

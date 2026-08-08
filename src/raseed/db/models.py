@@ -44,6 +44,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -262,8 +263,26 @@ class Transaction(Base):
 
     __tablename__ = "transactions"
     __table_args__ = (
-        #: Dedupe level 1: the same image never lands twice.
-        UniqueConstraint("user_id", "image_sha256", name="uq_transactions_user_image"),
+        #: Dedupe level 1: the same image never lands twice **while it is live**.
+        #:
+        #: Partial, and that is load-bearing. A plain UNIQUE over all rows
+        #: contradicted `queries.find_by_image_hash`, which deliberately ignores
+        #: soft-deleted matches so that resending a receipt is how you undo an
+        #: `/undo`. With the constraint covering deleted rows too, the dedupe
+        #: check said "not a duplicate", extraction ran and was paid for, and
+        #: then the INSERT died on the constraint. It crashed the live bot twice
+        #: on 2026-08-08. See docs/DECISIONS.md.
+        #:
+        #: Invariant 2 keeps soft-deleted rows forever, so the exclusion is what
+        #: makes deletion reversible rather than permanent.
+        Index(
+            "uq_transactions_user_image",
+            "user_id",
+            "image_sha256",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         #: Every period query runs off this pair. Invariant 6.
         Index("ix_transactions_user_local_date", "user_id", "occurred_on_local"),
         Index("ix_transactions_user_merchant", "user_id", "merchant_id"),

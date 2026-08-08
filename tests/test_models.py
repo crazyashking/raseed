@@ -282,6 +282,73 @@ def test_the_same_image_cannot_land_twice(seeded: tuple[Session, User]) -> None:
         session.commit()
 
 
+def test_resending_a_soft_deleted_receipt_is_allowed(seeded: tuple[Session, User]) -> None:
+    """`/undo` then resend the same image. It crashed the live bot on 2026-08-08.
+
+    `queries.find_by_image_hash` ignores soft-deleted matches on purpose, so
+    that resending is how you undo an `/undo`. A UNIQUE constraint covering
+    deleted rows made that path impossible: the dedupe check passed, the
+    extraction was paid for, and the INSERT then died on the constraint.
+
+    The index is partial now. Invariant 2 keeps the deleted row forever, and
+    keeping it must not make the deletion permanent.
+    """
+    session, user = seeded
+    sha = "c" * 64
+
+    def txn() -> Transaction:
+        return Transaction(
+            user_id=user.id,
+            source=Source.TELEGRAM_IMAGE,
+            image_sha256=sha,
+            grand_total_minor=25600,
+            reconciliation_outcome=ReconciliationOutcome.BALANCED,
+            occurred_on_local=dt.date(2026, 8, 8),
+            date_source=DateSource.RECEIPT_PRINTED,
+        )
+
+    first = txn()
+    session.add(first)
+    session.commit()
+
+    first.deleted_at = dt.datetime(2026, 8, 8, 23, 26, tzinfo=dt.UTC)
+    session.commit()
+
+    session.add(txn())
+    session.commit()  # would raise IntegrityError against a total constraint
+
+    live = session.scalars(
+        select(Transaction).where(Transaction.image_sha256 == sha, Transaction.deleted_at.is_(None))
+    ).all()
+    assert len(live) == 1
+    # Invariant 2: the deleted row is still there, it just stopped blocking.
+    assert (
+        len(session.scalars(select(Transaction).where(Transaction.image_sha256 == sha)).all()) == 2
+    )
+
+
+def test_two_live_rows_still_cannot_share_an_image(seeded: tuple[Session, User]) -> None:
+    """Making the index partial must not weaken dedupe for live rows."""
+    session, user = seeded
+
+    def txn() -> Transaction:
+        return Transaction(
+            user_id=user.id,
+            source=Source.TELEGRAM_IMAGE,
+            image_sha256="d" * 64,
+            grand_total_minor=1000,
+            reconciliation_outcome=ReconciliationOutcome.BALANCED,
+            occurred_on_local=dt.date(2026, 8, 8),
+            date_source=DateSource.RECEIPT_PRINTED,
+        )
+
+    session.add(txn())
+    session.commit()
+    session.add(txn())
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Refunds (brief 16.8)
 # ---------------------------------------------------------------------------

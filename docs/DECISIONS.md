@@ -921,9 +921,25 @@ the options are not equivalent, so it is not being guessed at.
 ### 2026-08-08: The dashboard is a web app, and it ships loopback-only first
 
 Ashrit asked for a web dashboard reached from a button in Telegram, Rocket Money
-in shape if not in scope. There is no dashboard anywhere in the brief, so this
-is a scope addition rather than a commit off the section 17 list, and it is
-recorded here rather than assumed.
+in shape if not in scope.
+
+**Correction to what I wrote earlier today.** I said "there is no dashboard
+anywhere in the brief". That is wrong. Section 8's stack table has a row for it:
+*"Dashboard (v2) | FastAPI + React | Better portfolio value than Streamlit.
+Streamlit is faster if you only want the data."* So the brief anticipated a
+dashboard, named a preferred stack, and named an alternative. What is true is
+narrower: the dashboard is absent from the **section 17 commit list**, so its
+timing was a scope decision even though its existence was not.
+
+**And I built neither of the two options the brief names.** Not FastAPI, not
+Streamlit, but the standard library. The reason is invariant 12: neither is on
+the section 23.1 allowlist, and React would add a whole toolchain besides. Four
+read-only routes for one user did not justify that conversation. This is a real
+deviation from section 8 and it is recorded as one rather than glossed over.
+
+It is also cheap to reverse. `web/data.py` returns plain dataclasses and knows
+nothing about HTTP, so a FastAPI or React front end would replace `render.py`
+and `server.py` and keep every aggregate and every test.
 
 **Loopback first, public second, and never public without authentication.** The
 server binds `127.0.0.1` and `HOST` is deliberately not readable from the
@@ -996,6 +1012,133 @@ receipts as "09 Aug 2026, 6 items, ₹256.00" and not "Blinkit ₹256.00". If th
 reads as a gap once there are fifty rows in the table, seeding a handful of
 common merchants is a small change and nothing built since depends on their
 absence.
+
+### 2026-08-08: Two files contradicted each other, and it crashed the live bot
+
+Found in the bot log, not by a test. Ashrit ran `/undo` on both receipts and
+resent one. The confirm crashed with:
+
+```
+IntegrityError: UNIQUE constraint failed:
+  transactions.user_id, transactions.image_sha256
+```
+
+Twice in four minutes, and he saw nothing either time.
+
+**The contradiction.** `db/queries.find_by_image_hash` deliberately ignores
+soft-deleted matches, and its docstring says why: *"A soft-deleted match does
+not count, because the user deleted it on purpose and resending is how you undo
+that."* But `uq_transactions_user_image` covered every row, deleted or not.
+Those two statements cannot both hold. The dedupe check reported "not a
+duplicate", extraction ran and **was billed**, and the INSERT then died.
+
+Both shipped in commits 4 and 7 respectively, both were tested, and neither test
+could have caught it: one tests the query, the other tests the constraint, and
+the bug lives in the space between them.
+
+**Resolved by making the index partial:** `WHERE deleted_at IS NULL`. Invariant
+2 keeps soft-deleted rows forever, and keeping them must not make a deletion
+permanent. Live rows still cannot collide, which a second test pins so the fix
+cannot be over-applied. Migration `8f2c1a740e93`. SQLite and Postgres both
+support partial indexes, which matters because brief section 8 puts Postgres on
+the roadmap.
+
+The constraint lost, not the query, because `/undo` has to be reversible. A
+receipt you can delete but never re-add is a trap.
+
+### 2026-08-08: No error handler, so a crash looked exactly like a dead bot
+
+The same incident, second finding. python-telegram-bot logged `No error handlers
+are registered` and the user got **silence**. He tapped Confirm and nothing came
+back.
+
+Silence is the worst answer available, because it is indistinguishable from the
+process being down. `RaseedBot.on_error` is now registered and replies
+"Something went wrong on my end and I did not save that one. Nothing was
+changed."
+
+Invariant 10 still applies when the bot is the thing that broke. "Something went
+wrong on my end" is a statement about the bot. "Try sending it as a file" would
+be an instruction to the user, and a test asserts the error text contains no
+such phrase. The handler also swallows a failure to deliver its own message,
+because an error handler that raises leaves PTB with nowhere to go.
+
+### 2026-08-08: Two bot instances were polling the same token
+
+The log filled with `Conflict: terminated by other getUpdates request`. Two
+`run.py` processes were alive at once, which Telegram does not allow: only one
+consumer may call `getUpdates` for a token, and the two kept evicting each
+other. Both were stopped and one clean instance started.
+
+Worth knowing rather than fixing in code for now: nothing prevents a second
+instance from being launched. A pidfile or a single-instance lock is the obvious
+guard, and it matters more once this is hosted rather than run by hand.
+
+### 2026-08-08: Real receipts are English, and the lexicon was built for Hindi
+
+Brief 4.5 rests on Indian grocery vocabulary being Hinglish. Measured against
+the twelve real line items in the ledger, a Hinglish-keyed lexicon matched
+**3 of 12**. Blinkit and Zepto print "Green Cucumber", "Fresh White Eggs",
+"English Oven Milk Bread".
+
+Two fixes, both measured:
+
+- **Every term indexes its `canonical` English name as a lookup surface.** So
+  `kheera` catches "Green Cucumber" without a second entry, and the Hinglish
+  keys earn their keep on receipts that never say a Hindi word.
+- **N-gram matching, widest first.** A third of the lexicon is multi-word
+  (`moong dal`, `garam masala`, `shimla mirch`) and was unreachable by
+  single-token matching: "Moong Dal" tokenizes to two tokens and neither is a
+  surface. Longest wins, and a token consumed by a wide match is not offered to
+  a narrow one.
+
+Result: **12 of 12** on real line items, 7 of 7 on the spelling drift brief 4.5
+names, zero false positives on a non-grocery control set.
+
+### 2026-08-08: The fuzzy threshold is measured, and one rule beats one number
+
+Scored `fuzz.ratio` over the drift pairs brief 4.5 names against grocery words
+that must not collapse into each other:
+
+| | |
+|---|---|
+| genuine drift, worst | zeera/jeera 80.0, bhendi/bhindi 83.3, panner/paneer 83.3 |
+| false positive, worst | paneer/paper 72.7, namak/namkeen 66.7 |
+
+78 sits in that gap. **`WRatio` was rejected**: it scores paneer against paper at
+90, which would file a sheet of paper under dairy.
+
+One false positive survived: `phone` scores 80 against `honey`, putting a phone
+charger in groceries. Fixed with a rule rather than a number: **a fuzzy match
+must agree on its first letter.** Transliteration drift happens in the middle of
+a word, not at the start. Where the initial sound genuinely does change
+(jeera/zeera, the case the brief names) that is a `variants` entry and matches
+exactly.
+
+Genuinely different words for the same thing (curd/dahi at 25, chhole/chana at
+36) are not drift and no threshold reaches them. `variants` is the honest
+mechanism for those.
+
+### 2026-08-08: Brief 4.5's lexicon categories are from a retracted taxonomy
+
+Section 4.5's example YAML uses `vegetables`, `dairy_eggs` and `staples`. Those
+belong to the twelve-domain taxonomy that section 3.8 explicitly retracts
+("[CORRECTED: I overbuilt this]") in favour of Groceries, Food & Dining, Drinks,
+Entertainment, Uncategorized, with no sub-categories at launch.
+
+3.8 corrects 4.5, so `category` uses the five real slugs. Nothing is lost: the
+finer meaning moves to `canonical`, where it belongs. When there is enough
+grocery volume to split Groceries (3.8 says wait for that), the canonical names
+are already there and Stage 2 re-runs over stored extractions for free.
+
+### 2026-08-08: `types-PyYAML` not installed, and the stub is not missed
+
+mypy wants stubs for `yaml`. `types-PyYAML` is not on the section 23.1
+allowlist, so invariant 12 makes it a conversation, and it buys almost nothing
+here: `yaml.safe_load` returns `Any` whatever the stubs say, and the lexicon
+loader validates every field with explicit isinstance checks before trusting it.
+That runtime validation is what actually protects the lexicon. A mypy override
+records the reasoning.
 
 ---
 

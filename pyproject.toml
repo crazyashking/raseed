@@ -118,6 +118,16 @@ exclude = ["tools/render_receipts\\.py$"]
 module = ["pdfplumber.*", "pypdfium2.*"]
 ignore_missing_imports = true
 
+# PyYAML ships no inline types. The fix mypy suggests is `types-PyYAML`, which is
+# not on the section 23.1 allowlist, and invariant 12 makes that a conversation
+# rather than a convenience. It buys little here: `yaml.safe_load` returns Any
+# whatever the stubs say, and `enrichment/lexicon` validates every field it
+# reads with explicit isinstance checks before trusting it. That runtime
+# validation is what actually protects the lexicon, not the stub.
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------
