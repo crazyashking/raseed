@@ -125,6 +125,17 @@ def parse_printed_date(text: str | None, *, fallback_tz: str) -> dt.date | None:
     if not text:
         return None
     candidate = text.strip()
+
+    # ISO 8601 first. The schema asks for the date "exactly as printed", but the
+    # field is named `order_datetime_local` and models normalise it to ISO
+    # anyway: the first live receipt came back as `2026-07-30T12:44:00`, which
+    # every format below rejects. That silently dated a July receipt to August,
+    # and invariant 6 buckets period queries on exactly this value.
+    try:
+        return dt.datetime.fromisoformat(candidate).date()
+    except ValueError:
+        pass
+
     for fmt in DATE_FORMATS:
         try:
             parsed = dt.datetime.strptime(candidate, fmt).replace(tzinfo=zone(fallback_tz))

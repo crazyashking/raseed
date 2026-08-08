@@ -638,6 +638,26 @@ def test_a_printed_date_is_read(text: str, expected: dt.date) -> None:
     assert parse_printed_date(text, fallback_tz="Asia/Kolkata") == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The exact string the first live receipt returned. It parsed to None,
+        # which dated a 30 July receipt to 9 August.
+        ("2026-07-30T12:44:00", dt.date(2026, 7, 30)),
+        ("2026-07-30T12:44", dt.date(2026, 7, 30)),
+        ("2026-07-30T12:44:00+05:30", dt.date(2026, 7, 30)),
+        ("2026-07-30", dt.date(2026, 7, 30)),
+    ],
+)
+def test_an_iso_8601_datetime_is_read(text: str, expected: dt.date) -> None:
+    """The schema says "exactly as printed"; the model normalises anyway.
+
+    Invariant 6 buckets on this value, so rejecting the format the model
+    actually emits is a wrong-month bug, not a cosmetic one.
+    """
+    assert parse_printed_date(text, fallback_tz="Asia/Kolkata") == expected
+
+
 @pytest.mark.parametrize("text", [None, "", "yesterday", "some time last week"])
 def test_an_unreadable_date_is_not_invented(text: str | None) -> None:
     """Brief 24.4: never silently guess without recording that you guessed."""

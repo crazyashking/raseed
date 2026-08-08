@@ -824,6 +824,100 @@ calls `create_all`. Alembic owns the schema. A `create_all` that quietly
 disagreed with the migration history would be a data bug that only surfaced at
 the first migration, which is exactly the wrong time.
 
+### 2026-08-08: First live Telegram run, two real receipts, and four findings
+
+The bot ran end to end for the first time. Two real receipts (a Blinkit-style
+and a Zepto order), both extracted, both confirmed, both written to the ledger.
+The transport, the confirm flow, the gate, the append-only writes and the image
+deletion all worked. Four things came out of it that the synthetic eval could
+not have found.
+
+**1. The date parser rejected the format the model actually emits. Fixed.**
+
+`order_datetime_local` on receipt 2 came back as `2026-07-30T12:44:00`. Every
+entry in `DATE_FORMATS` uses a space separator, so ISO 8601 with `T` parsed to
+`None`, the flow fell back to the message timestamp, and a **30 July receipt was
+dated 9 August**. Invariant 6 buckets period queries on exactly this value, so
+that receipt would have landed in the wrong month's total.
+
+The schema asks for the date "exactly as printed, do not reformat". The model
+normalised it anyway, which is unsurprising for a field named
+`order_datetime_local`. `parse_printed_date` now tries
+`datetime.fromisoformat` before the printed-format list. Tests carry the exact
+live string.
+
+This is the class of bug only a real run finds: 45 flow tests passed against
+fixtures whose dates happened to be written the way the parser expected.
+
+**2. A ₹100 discount was counted twice, and the gate caught it. Unresolved.**
+
+Receipt 2 has a `ZEPINDCC100 Offer Applied` coupon of ₹100 in `discounts[]`, and
+its line totals sum to **exactly** the ₹627.00 grand total. So the discount is
+already inside the line prices and is also being subtracted again, which is
+precisely what invariant 13 forbids: *"A product discount already inside the
+line price is never repeated there."*
+
+The gate did its job. It returned Class 2 with a ₹100 gap rather than storing a
+silent inconsistency. But the stored `unaccounted_adjustment_minor = 10000` is
+misleading: nothing is unaccounted for, the model double-counted.
+
+Two readings, and they need different fixes:
+
+- The receipt prints post-discount effective line prices, the model copied them
+  correctly, and then wrongly also listed the order-level coupon. A prompt fix.
+- The model computed the distribution itself. The oddly precise line totals
+  (₹94.87, ₹50.89, ₹115.57, ₹70.73, ₹46.54) are consistent with a proportional
+  split, which is what a derived value looks like. A much more serious problem,
+  and a cousin of D2.
+
+**Not guessable from here.** The image was deleted on confirm, per invariant 7.
+Tracked as D6.
+
+**3. Invariant 7 has a real cost, now observed rather than theorised.**
+
+The finding above cannot be settled because the evidence is gone by design. This
+is not an argument for changing invariant 7, which exists for good reasons and
+stays as written. It is worth recording that "delete the image on confirm" and
+"diagnose a suspicious extraction afterwards" are in genuine tension, and that
+the resolution is to catch these before confirming, not after.
+
+**4. Cost is 2.2x the synthetic measurement.**
+
+| | Synthetic (2026-08-08) | Live, real receipts |
+|---|---|---|
+| Input tokens | 1,970 | 2,014 and 2,017 |
+| Output tokens | 1,280 | 2,684 and 3,062 |
+| Cost per receipt | $0.0113 | **$0.0246** |
+| 60 receipts/month | $0.68 | **$1.48** |
+
+Input was predicted almost exactly. Output was more than double, and output is
+87% of the bill at $7.50 per 1M. Real receipts have more line items and the
+model thinks longer about them.
+
+Section 4.6's conclusion still holds at $1.48/month, but the `DAILY_COST_LIMIT_USD`
+default of $1.00 is now about **40 receipts a day**, not the ~125 the comment in
+`.env.example` claims. That comment is stale. D5 updated.
+
+**One thing that worked exactly as designed:** `printed_product_discount_minor`
+came back as 10400 on receipt 1, and the MRP totals minus the paid totals for
+the five items carrying an MRP is 29900 - 19500 = 10400, to the paisa. The
+brief 24.3 cross-check is validated on real data, not just on fixtures.
+
+### 2026-08-08: The merchant quick-pick cannot bootstrap itself
+
+`merchant_name` came back `None` on both live receipts, which is exactly the
+situation brief 24.4 describes: an app screenshot rarely prints the merchant
+name. That is why the confirm keyboard offers previously seen merchants instead.
+
+But `known_merchants` only returns merchants already in the table, and nothing
+else writes to that table. On a fresh ledger the quick-pick is empty, so the
+first merchant can never be added, so it stays empty forever. Both live
+transactions have `merchant_id = NULL` and the `merchants` table is empty.
+
+This is a design gap in commit 7, not a bug in the code as specified. Tracked as
+D7. It needs a decision from Ashrit about how a merchant first gets named, and
+the options are not equivalent, so it is not being guessed at.
+
 ---
 
 ## Still open
