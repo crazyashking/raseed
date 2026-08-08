@@ -365,6 +365,68 @@ with no PII. They were picked to cover distinct shapes rather than at random:
 A test asserts those three properties of the fixture set itself, so a later edit
 cannot quietly narrow the coverage.
 
+### 2026-08-08: The gate returns four outcomes, not a boolean
+
+`BALANCED`, `SKIPPED`, `CLASS_1`, `CLASS_2`. `accepted` is true for the first
+two. A boolean would have collapsed "this photo is unreadable" together with
+"these numbers are 5 rupees out", and section 3.3 exists specifically because
+those need different handling: one asks for a retake, the other offers to log the
+gap. The verdict object also carries every number used to reach it, so the bot can
+show the user the actual mismatch rather than a generic failure.
+
+`unaccounted_adjustment_minor` is a property that returns non-None only on
+`CLASS_2`. That makes it structurally impossible to record an adjustment on a
+receipt that balanced.
+
+### 2026-08-08: Class 1 is checked before skip, and that ordering matters
+
+A receipt with zero line items goes down the `skip_reconciliation` path (section
+3.8). But an extraction with zero line items, zero charges, zero taxes, zero
+discounts and a grand total is not a utility bill: it is a failed read that
+happened to catch one number. Skipping it would store a total with nothing behind
+it, silently.
+
+So the Class 1 checks run first, and "a total was read but nothing else was" is
+one of them. `SKIPPED` is only reached when *something* was read and only the
+itemisation is absent. `blinkit_032` is the real case: zero line items, one
+convenience charge, and it skips correctly.
+
+### 2026-08-08: No default confidence floor
+
+Section 3.3 names low confidence as a Class 1 symptom but never fixes a number.
+`reconcile` therefore takes `min_confidence` as an optional keyword that defaults
+to off, rather than baking a guessed threshold into the gate. The bot layer
+supplies it at commit 7 once real receipts show where the line actually sits.
+This is deliberate under-specification, not an oversight.
+
+### 2026-08-08: `DEFAULT_TOLERANCE_MINOR` lives in `reconcile.py`
+
+It was briefly defined in `config.py`. The constant belongs with the gate that
+uses it, so `reconcile.py` owns it and `config.py` re-exports it as
+`DEFAULT_RECONCILIATION_TOLERANCE_MINOR`. One definition, no drift.
+
+### 2026-08-08: Eval sweep result, all 32 records
+
+`tools/sweep_eval.py` run against `data/eval/`. It is a committed tool rather
+than a test, because the suite must not depend on a gitignored directory.
+
+| | |
+|---|---|
+| Records swept | 32 |
+| `BALANCED` | 31, every one at delta exactly 0 |
+| `SKIPPED` | 1 (`blinkit_032`, zero line items) |
+| MRP cross-check `OK` | 31 |
+| MRP cross-check `NOT_APPLICABLE` | 1 (`blinkit_032`, no line carries an MRP) |
+| MRP `MISMATCH` | 0 |
+| Total product savings implied across the set | 374,200 paise (₹3,742) |
+
+Every delta is exactly zero, not merely inside the ±100 paise tolerance, which is
+the stronger result: the tolerance is not doing any work here and is reserved for
+the GST rounding it was added for.
+
+`blinkit_000`, the redacted real receipt, was swept separately and excluded from
+the count. It also reconciles at delta 0 and passes the MRP cross-check.
+
 ---
 
 ## Resolved decisions

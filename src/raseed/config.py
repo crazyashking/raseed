@@ -17,12 +17,14 @@ from typing import Final
 
 from dotenv import load_dotenv
 
+from raseed.validation.reconcile import DEFAULT_TOLERANCE_MINOR
+
 #: Repository root, resolved from this file so it works regardless of cwd.
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
 
-#: Brief section 18.4. Indian CGST and SGST are each rounded to the paisa, so a
-#: zero tolerance rejects receipts whose arithmetic is correct. One rupee.
-DEFAULT_RECONCILIATION_TOLERANCE_MINOR: Final[int] = 100
+#: Re-exported so there is exactly one definition of the tolerance. It lives with
+#: the gate that uses it, in `raseed.validation.reconcile`. Brief section 18.4.
+DEFAULT_RECONCILIATION_TOLERANCE_MINOR: Final[int] = DEFAULT_TOLERANCE_MINOR
 
 
 class ConfigError(RuntimeError):
