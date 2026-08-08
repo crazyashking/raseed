@@ -1,0 +1,44 @@
+{
+  "merchant_name": null,
+  "order_id": null,
+  "order_datetime_local": null,
+  "currency": "INR",
+  "line_items": [
+    {
+      "raw_name": "Real Mixed Fruit Juice 1L",
+      "quantity_text": "1 L x 2",
+      "mrp_minor": 26000,
+      "line_total_minor": 22000
+    },
+    {
+      "raw_name": "Lay's India's Magic Masala Chips 50g",
+      "quantity_text": "50 g x 3",
+      "mrp_minor": 6000,
+      "line_total_minor": 5400
+    },
+    {
+      "raw_name": "Cadbury Silk Chocolate 60g",
+      "quantity_text": "60 g x 2",
+      "mrp_minor": 16000,
+      "line_total_minor": 15000
+    }
+  ],
+  "charges": [
+    {
+      "label": "Handling charge",
+      "amount_minor": 1000
+    },
+    {
+      "label": "Platform charge",
+      "amount_minor": 500
+    }
+  ],
+  "discounts": [
+    {
+      "label": "FLAT100 Promo Code",
+      "amount_minor": 10000
+    }
+  ],
+  "taxes": [],
+  "grand_total_minor": 33900
+}

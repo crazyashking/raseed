@@ -1,0 +1,16 @@
+{
+  "merchant_name": null,
+  "order_id": null,
+  "order_datetime_local": null,
+  "currency": "INR",
+  "line_items": [],
+  "charges": [
+    {
+      "label": "Convenience charge",
+      "amount_minor": 1500
+    }
+  ],
+  "discounts": [],
+  "taxes": [],
+  "grand_total_minor": 1500
+}

@@ -299,6 +299,72 @@ comment in `pyproject.toml` and get pinned when that install actually happens.
 Ashrit's instruction was to move the file without editing its contents, so the
 formatter is excluded from that one path rather than the file being reformatted.
 
+### 2026-08-08: What the extraction schema does and does not carry
+
+Section 17 lists commit 2 as "the full Pydantic contract **including quantity/unit
+and refund modelling**". Two other sections of the brief place both of those
+elsewhere, and following section 17 literally would contradict them:
+
+- **Quantity and unit parsing is Stage 2.** Section 16.7 is explicit: parse
+  deterministically with a regex table over `raw_name`, and "this belongs in Stage
+  2". Stage 1 is verbatim transcription. So `LineItem` carries `quantity_text`
+  exactly as printed ("500 ml x 2") and nothing normalized. `quantity`, `unit`,
+  `unit_normalized`, `pack_count` and `normalized_slug` belong in the enrichment
+  schema at commit 9.
+- **Refunds are not an extraction concept.** Section 16.8 models a refund as its
+  own transaction with a negative `amount_minor` and a `related_transaction_id`.
+  That is a ledger shape, so it lands in `db/models.py` at commit 4. A refund is
+  never a field on the receipt being read.
+
+Resolution: commit 2 builds the extraction contract only, which is also exactly
+what Ashrit's STEP 6 asked for. Nothing is dropped, only placed where the brief
+itself puts it. Flagged to Ashrit rather than resolved silently.
+
+### 2026-08-08: Added `printed_product_discount_minor` to the extraction schema
+
+Section 24.3 specifies a cross-check: `sum(mrp_minor) - sum(line_total_minor)`
+should equal **the printed product discount**. There was no field to hold the
+printed value, so the check had nothing to compare against and could not be
+implemented as written.
+
+Added as a nullable field with a description that explicitly separates it from
+`discounts[]`, so invariant 13 is not weakened: it is a cross-check input, never a
+reconciliation term. All 32 eval fixtures leave it null, because the renderer
+computes that line rather than storing it, so the cross-check degrades cleanly to
+the per-line and aggregate MRP invariants when it is absent.
+
+This is an addition required to implement the brief, not a change to a decision in
+it. Raised with Ashrit in the commit 3 report.
+
+### 2026-08-08: `grand_total_minor` is the last field, and that is a real trade-off
+
+Fields are declared in receipt reading order, top to bottom, so the model
+transcribes items, then charges, then the total. The alternative is putting the
+total first so it anchors before the items are read.
+
+Reading order was chosen because it is what a literal transcriber does, and
+because the field description says to COPY the printed total and never compute it.
+But the risk is genuine: if the model derives the total from its own item sum, the
+reconciliation gate becomes tautological and catches nothing. That is not
+detectable from a schema test. It has to be measured at commit 6 by feeding
+deliberately corrupted receipts and checking that the gate still fires. Noted here
+so it is not forgotten.
+
+### 2026-08-08: Test fixtures committed, and why these three
+
+`blinkit_001`, `blinkit_026` and `blinkit_032` are copied into `tests/fixtures/`
+so the suite runs on a fresh clone with `data/` absent. All three are synthetic
+with no PII. They were picked to cover distinct shapes rather than at random:
+
+| Fixture | Shape it covers |
+|---|---|
+| `blinkit_001` | Normal receipt, one line with a null `mrp_minor`, a zero-value "Delivery charges" line |
+| `blinkit_026` | Order-level coupon in `discounts[]`, every line has an MRP |
+| `blinkit_032` | Zero line items, the `skip_reconciliation` case from section 3.8 |
+
+A test asserts those three properties of the fixture set itself, so a later edit
+cannot quietly narrow the coverage.
+
 ---
 
 ## Resolved decisions

@@ -1,0 +1,57 @@
+{
+  "merchant_name": null,
+  "order_id": null,
+  "order_datetime_local": null,
+  "currency": "INR",
+  "line_items": [
+    {
+      "raw_name": "Amul Taaza Toned Milk 500ml",
+      "quantity_text": "500 ml x 2",
+      "mrp_minor": null,
+      "line_total_minor": 5600
+    },
+    {
+      "raw_name": "Britannia Brown Bread 400g",
+      "quantity_text": "400 g x 1",
+      "mrp_minor": 5500,
+      "line_total_minor": 5000
+    },
+    {
+      "raw_name": "Fresho Pyaz / Onion",
+      "quantity_text": "1 kg x 1",
+      "mrp_minor": 4500,
+      "line_total_minor": 3800
+    },
+    {
+      "raw_name": "Aalu / Potato 1kg",
+      "quantity_text": "1 kg x 1",
+      "mrp_minor": 3500,
+      "line_total_minor": 2800
+    },
+    {
+      "raw_name": "Desi Tamatar 500g",
+      "quantity_text": "500 g x 1",
+      "mrp_minor": 2500,
+      "line_total_minor": 2000
+    },
+    {
+      "raw_name": "Dhaniya / Coriander Leaves 100g",
+      "quantity_text": "100 g x 1",
+      "mrp_minor": 1800,
+      "line_total_minor": 1500
+    }
+  ],
+  "charges": [
+    {
+      "label": "Handling charge",
+      "amount_minor": 1200
+    },
+    {
+      "label": "Delivery charges",
+      "amount_minor": 0
+    }
+  ],
+  "discounts": [],
+  "taxes": [],
+  "grand_total_minor": 21900
+}
