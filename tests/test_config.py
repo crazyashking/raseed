@@ -11,10 +11,12 @@ repo root on the development machine, and a test must not read it.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
+from raseed.__main__ import TOKEN_LEAKING_LOGGERS, _silence_token_leaking_loggers
 from raseed.config import (
     DEFAULT_DAILY_COST_LIMIT_MICROS,
     ConfigError,
@@ -151,6 +153,22 @@ def test_settings_load_from_a_dotenv_file(tmp_path: Path) -> None:
     assert settings.daily_cost_limit_micros == 750_000
     assert settings.gemini_model == "gemini-3.6-flash"
     assert settings.default_timezone == "Asia/Kolkata"
+
+
+def test_the_token_leaking_loggers_are_silenced(caplog: pytest.LogCaptureFixture) -> None:
+    """The Telegram API puts the bot token in the URL path.
+
+    `httpx` logs the full request URL at INFO, so a default `LOG_LEVEL=INFO`
+    writes the token to disk on every poll, several times a minute. Keeping it
+    out of `Settings.__repr__` is pointless if a dependency prints it anyway.
+    """
+    _silence_token_leaking_loggers()
+    for name in TOKEN_LEAKING_LOGGERS:
+        assert logging.getLogger(name).level == logging.WARNING
+
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("httpx").info("POST https://api.telegram.org/bot123:SECRET/getMe")
+    assert "SECRET" not in caplog.text
 
 
 def test_secrets_stay_out_of_the_repr(tmp_path: Path) -> None:

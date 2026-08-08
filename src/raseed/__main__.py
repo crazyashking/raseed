@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import sys
+from typing import Final
 
 from sqlalchemy.orm import sessionmaker
 
@@ -31,6 +32,19 @@ log = logging.getLogger("raseed")
 
 #: Gitignored, and swept on every start. Invariant 7 and brief 16.5.
 INCOMING = PROJECT_ROOT / "data" / "incoming"
+
+
+#: Loggers that print the request URL, which for the Telegram API carries the
+#: bot token in the path. At INFO they write the token to disk on every poll,
+#: several times a minute, forever. `Settings` goes to the trouble of keeping
+#: secrets out of its `repr`; letting a dependency log them anyway would make
+#: that pointless. Raised to WARNING regardless of LOG_LEVEL.
+TOKEN_LEAKING_LOGGERS: Final[tuple[str, ...]] = ("httpx", "httpcore", "telegram.request")
+
+
+def _silence_token_leaking_loggers() -> None:
+    for name in TOKEN_LEAKING_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def now_utc() -> dt.datetime:
@@ -78,6 +92,7 @@ def main() -> int:
         level=settings.log_level,
         format="%(asctime)s %(levelname)-8s %(name)s %(message)s",
     )
+    _silence_token_leaking_loggers()
 
     try:
         zone(settings.default_timezone)
