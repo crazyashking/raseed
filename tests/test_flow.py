@@ -311,6 +311,163 @@ def test_confirming_writes_the_ledger_and_deletes_the_image(
     assert not image_path.exists()
 
 
+# ---------------------------------------------------------------------------
+# A confirm that fails must not cost the user the receipt
+#
+# Live regression, 2026-08-09: three receipts were extracted and paid for, and
+# none of the three reached the ledger. `confirm` used to pop the pending entry
+# before doing any of the work that can fail, so a single failure left a button
+# on screen with nothing behind it, and the only way forward was to resend and
+# pay for extraction again.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_confirm_leaves_the_button_usable(
+    seeded: tuple[Session, User], store: ImageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The receipt survives the failure and the same button works on the retry."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    def explode(*_args: object, **_kwargs: object) -> Transaction:
+        msg = "the connection went away mid-write"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("raseed.adapters.flow.ledger.record_transaction", explode)
+
+    with pytest.raises(RuntimeError):
+        flow.confirm(session, pending.key)
+
+    # The entry is still there, the image is still there, nothing was stored.
+    assert flow.pending_for(pending.key) is not None
+    assert pending.image_path is not None
+    assert pending.image_path.exists()
+    assert session.scalars(select(Transaction)).all() == []
+
+    # And the second tap on the same button works.
+    monkeypatch.undo()
+    result = flow.confirm(session, pending.key)
+    assert result.step is Step.STORED
+    assert not pending.image_path.exists()
+
+
+def test_stage_two_failing_never_costs_the_receipt(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A categorizer that raises something outside the provider taxonomy.
+
+    `httpx.ConnectError` is the real one: a DNS failure inside the Gemini SDK is
+    not an `APIError`, so it used to escape every `ProviderError` handler
+    between there and here and take the confirm down with it.
+    """
+
+    class Unreachable:
+        model_id = "gemini-3.5-flash-lite"
+
+        def categorize(self, _request: CategorizationRequest) -> CategorizationProviderResult:
+            msg = "[Errno 11001] getaddrinfo failed"
+            raise OSError(msg)
+
+    session, user = seeded
+    unknown = an_extraction(
+        line_items=[
+            {
+                "raw_name": "Colgate Strong Teeth",
+                "quantity_text": None,
+                "mrp_minor": None,
+                "line_total_minor": 21900,
+            }
+        ]
+    )
+    flow = make_flow(
+        StubProvider(unknown),
+        store,
+        categorizer=Unreachable(),  # type: ignore[arg-type]
+    )
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    result = flow.confirm(session, pending.key)
+    session.commit()
+
+    assert result.step is Step.STORED
+    items = session.scalars(select(TransactionLineItem)).all()
+    assert items, "the receipt is in the ledger"
+    # Uncategorized where the lexicon could not place it, which is the whole
+    # point: re-runnable later from raw_extractions, for free.
+    assert any(item.category_source is None for item in items)
+
+
+def test_confirming_the_same_image_twice_is_not_a_crash(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Two pending entries for one image, which is what resending produces.
+
+    The second confirm used to reach the partial unique index and surface as
+    "something went wrong on my end". It is not a crash, it is a duplicate, and
+    the user is entitled to be told which.
+    """
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+
+    first = submit(flow, session, user, message_id=1).pending
+    second = submit(flow, session, user, message_id=2).pending
+    assert first is not None and second is not None
+    assert first.key != second.key
+
+    assert flow.confirm(session, first.key).step is Step.STORED
+    session.commit()
+
+    result = flow.confirm(session, second.key)
+    session.commit()
+
+    assert result.step is Step.DUPLICATE
+    assert result.duplicate_of is not None
+    assert len(session.scalars(select(Transaction)).all()) == 1
+
+
+def test_an_expired_confirm_says_which_thing_happened(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The pending store is in memory, so a restart empties it silently.
+
+    The buttons stay on screen looking live. "That one is no longer waiting"
+    was true and read like a malfunction, so it now names the two real causes
+    and states that nothing was saved.
+    """
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    # What a restart looks like from here: same key, empty store.
+    restarted = make_flow(StubProvider(an_extraction()), store)
+
+    result = restarted.confirm(session, pending.key)
+
+    assert result.step is Step.EXPIRED
+    assert "restarted" in result.message
+    assert "Nothing was saved" in result.message
+    # And it does not tell anyone how to send a receipt. Invariant 10.
+    for banned in ("crop", "rotate", "as a file", "retake", "better photo"):
+        assert banned not in result.message.lower()
+
+
+def test_a_provider_that_ignores_its_own_contract_does_not_lose_the_image(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Brief 16.5: a failure at extraction keeps the image so the receipt survives."""
+    session, user = seeded
+    flow = make_flow(StubProvider(OSError("[Errno 11001] getaddrinfo failed")), store)
+
+    result = submit(flow, session, user)
+
+    assert result.step is Step.EXTRACTION_FAILED
+    assert len(store) == 1, "the image stays on disk"
+
+
 def test_discarding_stores_nothing_and_deletes_the_image(
     seeded: tuple[Session, User], store: ImageStore
 ) -> None:
@@ -930,9 +1087,16 @@ def another_user(session: Session) -> User:
     return user
 
 
-def burn(session: Session, user: User, micros: int) -> None:
-    """Spend money on the API without going through the flow."""
-    record_extraction(
+def burn(session: Session, user: User, micros: int, *, when: dt.datetime = NOW) -> None:
+    """Spend money on the API without going through the flow.
+
+    `when` is stamped explicitly rather than left to `server_default=func.now()`.
+    The cap compares a row's `created_at` against a window derived from the
+    flow's *injected* clock, so a row timestamped by the real one makes the test
+    depend on what day it is run: the rolling-window case below passed until the
+    wall clock drifted past `NOW + 1 day` and then began failing on its own.
+    """
+    raw = record_extraction(
         session,
         user_id=user.id,
         result=ProviderResult(
@@ -947,6 +1111,7 @@ def burn(session: Session, user: User, micros: int) -> None:
         source=Source.TELEGRAM_IMAGE,
         image_sha256=None,
     )
+    raw.created_at = when
     session.commit()
 
 

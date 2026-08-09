@@ -216,6 +216,7 @@ class RaseedBot:
                 mime_type=mime_type,
                 message_date=message.date,
             )
+            log.info("receipt -> %s", result.step.value)
             session.commit()
             await self._reply(update, result, session=session, user_id=owner.id)
 
@@ -237,6 +238,13 @@ class RaseedBot:
             if owner is None:
                 return
             result = self.dispatch(session, action, key)
+            # One line per press, at INFO. A confirm that quietly answered
+            # "no longer waiting" used to leave no trace anywhere, which is why
+            # a broken-looking button on 2026-08-09 had to be reconstructed from
+            # the ledger rather than read off a log. The action and the step are
+            # enough to tell a restart from a duplicate from a crash, and
+            # neither is a receipt, an amount, or anything about the sender.
+            log.info("button %s -> %s", action, result.step.value)
             session.commit()
 
             if result.step is Step.AWAITING_CONFIRMATION and result.pending is not None:

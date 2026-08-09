@@ -209,6 +209,14 @@ class GeminiProvider:
             )
         except errors.APIError as exc:
             raise _translate(exc) from exc
+        except Exception as exc:
+            # Everything the SDK does NOT wrap. A DNS failure or a dropped
+            # connection is an `httpx` error, not an `APIError`, and would
+            # otherwise leave this method as a raw transport exception and skip
+            # the retry entirely. Broad on purpose: the only statement inside
+            # the try is the API call. See the Stage 2 provider for the same
+            # guard and the reasoning in full.
+            raise ProviderTransientError(f"could not reach gemini: {exc}") from exc
 
         extraction, response_text = _parse(response)
         input_tokens, output_tokens, thought_tokens = _usage(response)

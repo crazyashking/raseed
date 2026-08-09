@@ -1385,6 +1385,74 @@ caller cannot map the routes.
 machine, so the listener never needs to be reachable from the network, and the
 public name resolves to Cloudflare rather than to a home IP address.
 
+### 2026-08-09: a confirm that fails must leave the button working
+
+Reported live: the Confirm button "not working and returning an error message".
+The ledger told the story. Two transactions were confirmed at 21:43 and 21:52
+UTC, both soft-deleted by `/undo` at 23:26, and then three extractions at
+23:26, 23:27 and 23:31 that produced no transaction at all. Three receipts read,
+three receipts paid for, nothing saved.
+
+Four separate defects, found by replaying those stored extractions:
+
+**`confirm` consumed the pending entry before doing the work that can fail.**
+`pop` came first, so any failure after it left a button on screen with nothing
+behind it. The receipt could not be retried, only resent and paid for again. The
+entry is now read, and removed only once the row is in the ledger.
+
+**A transport failure escaped the provider error taxonomy entirely.** Both
+Gemini providers translated `errors.APIError` and nothing else. Verified against
+the SDK: an unreachable host raises `httpx.ConnectError`, for which
+`isinstance(exc, errors.APIError)` is False. So a DNS blip, which the log shows
+happening at 08:06 on 2026-08-09, arrived at the caller as a raw transport
+exception, past every `except ProviderError` between here and there. On the
+confirm path that took down a confirm; on the submit path it would have taken
+down an extraction whose image was already saved.
+
+That made a liar of `_apply_fallback`'s docstring, which promises that a failed
+Stage 2 never costs the user the receipt. That promise is now unconditional:
+it catches everything, because it must not depend on a vendor SDK being
+disciplined about which exception type it raises.
+
+**Confirming the same image twice was a crash rather than an answer.** Resending
+is what a person does when a button looks broken, and each resend produces
+another pending entry for the same bytes. The second confirm reached the partial
+unique index and surfaced as "something went wrong on my end". It now checks for
+an already-logged transaction before Stage 2 runs, so the answer is "already
+logged on 09 Aug" and no money is spent reaching it.
+
+**Nothing logged what a button press did.** A confirm that answered "no longer
+waiting" wrote no line anywhere, which is why this had to be reconstructed from
+the ledger rather than read from the log. One INFO line per press now records
+the action and the resulting step, and neither is a receipt, an amount, or
+anything about the sender.
+
+The most likely thing actually tapped, incidentally, was none of those: the
+receipts were submitted at 16:26-16:31 local and the bot was restarted at 18:04,
+and the pending store is in memory. `EXPIRED_MESSAGE` now says so ("it either
+timed out or I was restarted since. Nothing was saved") instead of the previous
+"that one is no longer waiting", which was accurate and useless.
+
+**Not fixed, and deliberately: the pending store is still in memory.** Persisting
+it would make a restart survivable, and it is not a change to make quietly.
+`raw_extractions` already holds everything needed to rebuild a pending receipt,
+so it is cheap, but it also makes a confirm button valid indefinitely and brief
+16.4 gives it a 24 hour life. That is Ashrit's call, not mine.
+
+### 2026-08-09: a test that only passed in the morning
+
+`test_the_global_cap_is_a_rolling_window` began failing on its own, with no code
+change. `burn()` wrote spend rows with `server_default=func.now()`, the real
+clock, while the flow compares them against a window derived from its injected
+clock. The test asserted that a row falls outside a window two days after `NOW`,
+which held only while the wall clock was behind `NOW + 1 day`. It passed for a
+day and then stopped.
+
+The rows are now stamped explicitly. Worth recording because the failure looked
+exactly like a regression in the cost cap and was not one: a test that reads the
+real clock while the code reads an injected one is a test that reports the date,
+not the behaviour.
+
 ---
 
 ## Still open

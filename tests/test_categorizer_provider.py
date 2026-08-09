@@ -238,6 +238,29 @@ def test_a_rate_limit_is_transient() -> None:
         provider.categorize(a_request())
 
 
+def test_a_dropped_connection_becomes_a_transient_error() -> None:
+    """The live regression of 2026-08-09.
+
+    A DNS failure inside the SDK raises `httpx.ConnectError`, which is NOT an
+    `errors.APIError`, so it used to travel straight through this provider, past
+    every `ProviderError` handler above it, and take down whatever was calling.
+    On the confirm path that meant a paid-for receipt that could not be saved.
+    """
+    provider = categorizer([OSError("[Errno 11001] getaddrinfo failed")], max_attempts=1)
+    with pytest.raises(ProviderTransientError, match="could not reach gemini"):
+        provider.categorize(a_request())
+
+
+def test_a_dropped_connection_is_retried() -> None:
+    """Transient, so the retry still gets its chances before anyone gives up."""
+    parsed = a_result((0, "groceries", 0.9))
+    provider = categorizer(
+        [OSError("connection reset"), FakeResponse(parsed=parsed)],
+        max_attempts=2,
+    )
+    assert provider.categorize(a_request()).categorization == parsed
+
+
 def test_a_refusal_is_reported_as_blocked() -> None:
     feedback = type("Feedback", (), {"block_reason": "SAFETY"})()
     provider = categorizer([FakeResponse(prompt_feedback=feedback)])

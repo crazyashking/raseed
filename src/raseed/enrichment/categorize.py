@@ -44,7 +44,6 @@ from raseed.enrichment.providers.base import (
     CategorizationProvider,
     CategorizationProviderResult,
     CategorizationRequest,
-    ProviderError,
 )
 
 log = logging.getLogger(__name__)
@@ -311,8 +310,15 @@ def _apply_fallback(
 
     try:
         result = provider.categorize(request)
-    except ProviderError:
-        log.warning("stage 2 fallback failed, leaving %d items uncategorized", len(unresolved))
+    except Exception:
+        # Every failure, not only the ones that arrive as a `ProviderError`.
+        # The promise in this docstring is absolute, so it must not depend on a
+        # provider being well behaved about which exception type it raises: an
+        # `httpx` timeout leaking through an SDK is exactly as much "the
+        # fallback did not work" as a 503 is, and the user must not lose a
+        # confirmed receipt to either. `log.exception` rather than `warning`
+        # because the type is now the interesting part.
+        log.exception("stage 2 fallback failed, leaving %d items uncategorized", len(unresolved))
         return outcome
 
     permitted = frozenset(allowed)

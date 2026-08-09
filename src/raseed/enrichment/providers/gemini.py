@@ -192,6 +192,19 @@ class GeminiCategorizer:
             )
         except errors.APIError as exc:
             raise _translate(exc) from exc
+        except Exception as exc:
+            # Everything the SDK does NOT wrap. A DNS failure, a refused
+            # connection or a read timeout surfaces as an `httpx` error, which
+            # is not an `APIError`, so without this it escapes the provider
+            # taxonomy entirely and reaches the caller as a raw transport
+            # exception. Verified against the SDK: an unreachable host raises
+            # `httpx.ConnectError`, and `isinstance(exc, errors.APIError)` is
+            # False. That is what turned a network blip into a failed confirm.
+            #
+            # Broad on purpose, and safe because the only statement inside the
+            # try is the API call itself. Transient, so the retry above still
+            # gets its chances before anyone gives up.
+            raise ProviderTransientError(f"could not reach gemini: {exc}") from exc
 
         categorization, response_text = _parse(response)
         input_tokens, output_tokens = _usage(response)

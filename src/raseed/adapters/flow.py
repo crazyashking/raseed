@@ -29,6 +29,7 @@ from enum import Enum
 from typing import Final
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from raseed.adapters.images import ImageStore
@@ -75,6 +76,20 @@ DATE_FORMATS: Final[tuple[str, ...]] = (
     "%d %b %Y, %I:%M %p",
     "%d %b %Y",
     "%d %B %Y",
+)
+
+#: What a button says when the state behind it is gone.
+#:
+#: The pending store is in memory (see `adapters.pending`), so a restart drops
+#: every outstanding confirmation while the buttons stay on screen looking live.
+#: "That one is no longer waiting" was true and useless: it reads like a
+#: malfunction and says nothing about whether anything was saved. Naming the two
+#: real causes costs one sentence and turns a support question into a fact.
+#:
+#: It says nothing about *how* to send a receipt. Invariant 10.
+EXPIRED_MESSAGE: Final[str] = (
+    "I do not have that one waiting any more. It either timed out or I was "
+    "restarted since. Nothing was saved."
 )
 
 
@@ -223,11 +238,22 @@ class ReceiptFlow:
         request = ExtractionRequest(images=(ImagePayload(data=data, mime_type=mime_type),))
         try:
             result = self._provider.extract(request)
-        except ProviderError as exc:
-            # The image stays on disk. Brief 16.5: the receipt must not be lost.
+        except Exception as exc:
+            # The image stays on disk either way. Brief 16.5: the receipt must
+            # not be lost.
+            #
+            # `Exception` rather than `ProviderError`, because a provider that
+            # raises outside its own taxonomy is a provider bug and a receipt is
+            # the wrong thing to spend on one. That is not hypothetical: a DNS
+            # failure inside the Gemini SDK arrives as an `httpx` error, which
+            # is not an `APIError` and so was never translated at all.
+            detail = f" {exc}"
+            if not isinstance(exc, ProviderError):
+                log.exception("extraction provider raised outside its own error taxonomy")
+                detail = ""
             return FlowResult(
                 step=Step.EXTRACTION_FAILED,
-                message=f"I could not read that one right now. {exc}",
+                message=f"I could not read that one right now.{detail}",
             )
 
         raw = ledger.record_extraction(
@@ -372,17 +398,45 @@ class ReceiptFlow:
     # -- the user's decision -------------------------------------------------
 
     def confirm(self, session: Session, key: PendingKey) -> FlowResult:
-        """Commit a pending receipt and delete its image. Invariant 7."""
+        """Commit a pending receipt and delete its image. Invariant 7.
+
+        The pending entry is **read, not consumed**, and is only removed once the
+        row is actually in the ledger. Popping first looks tidier and is wrong:
+        anything that fails afterwards, a duplicate, a dropped connection during
+        Stage 2, a bug, leaves the user holding a button that can never work
+        again, with the receipt gone and the extraction already paid for. Every
+        failure below therefore leaves the entry in place so the same button
+        works on the next tap.
+        """
         now = self._clock()
-        receipt = self._pending.pop(key, now=now)
+        receipt = self._pending.get(key, now=now)
         if receipt is None:
-            return FlowResult(step=Step.EXPIRED, message="That one is no longer waiting.")
+            return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
 
         raw = session.get(RawExtraction, receipt.raw_extraction_id)
         if raw is None:
+            self._pending.pop(key, now=now)
             return FlowResult(
                 step=Step.EXPIRED, message="I lost track of that reading. Send it again."
             )
+
+        # Before Stage 2, which is where the money is. Submitting checks this
+        # too, but the receipt can be logged in between: send the same image
+        # twice, confirm one, then confirm the other. Without this the second
+        # tap reaches the unique index and surfaces as a crash rather than as
+        # the plain fact that it is already logged.
+        if raw.image_sha256:
+            already = queries.find_by_image_hash(
+                session, user_id=receipt.user_id, image_sha256=raw.image_sha256
+            )
+            if already is not None:
+                self._pending.pop(key, now=now)
+                self._images.delete(receipt.image_path)
+                return FlowResult(
+                    step=Step.DUPLICATE,
+                    message=f"Already logged on {already.occurred_on_local.isoformat()}.",
+                    duplicate_of=already,
+                )
 
         merchant = None
         if receipt.merchant_slug:
@@ -408,16 +462,33 @@ class ReceiptFlow:
                 image_sha256=raw.image_sha256,
             )
 
-        transaction = ledger.record_transaction(
-            session,
-            raw=raw,
-            reconciliation=receipt.reconciliation,
-            occurred_on_local=receipt.occurred_on_local,
-            date_source=(DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP),
-            merchant=merchant,
-            enrichment=stage2,
-        )
+        try:
+            transaction = ledger.record_transaction(
+                session,
+                raw=raw,
+                reconciliation=receipt.reconciliation,
+                occurred_on_local=receipt.occurred_on_local,
+                date_source=(
+                    DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP
+                ),
+                merchant=merchant,
+                enrichment=stage2,
+            )
+        except IntegrityError:
+            # The pre-check above closes the ordinary path, so reaching here
+            # means two confirms of the same image raced. Rolling back also
+            # discards the Stage 2 billing row written moments ago, which is the
+            # one thing here worth regretting: brief 16.6's cap cannot see spend
+            # that was rolled back. It is bounded to this race and to a single
+            # cheap call, and the alternative is a half-written ledger.
+            session.rollback()
+            log.exception("confirm hit the duplicate index for %s", key)
+            self._pending.pop(key, now=now)
+            self._images.delete(receipt.image_path)
+            return FlowResult(step=Step.DUPLICATE, message="I have already logged that one.")
 
+        # Only now. Everything above can fail and leave the button usable.
+        self._pending.pop(key, now=now)
         self._images.delete(receipt.image_path)
         return FlowResult(
             step=Step.STORED,
@@ -429,7 +500,7 @@ class ReceiptFlow:
         """Throw a pending receipt away, image and all."""
         receipt = self._pending.pop(key, now=self._clock())
         if receipt is None:
-            return FlowResult(step=Step.EXPIRED, message="That one is no longer waiting.")
+            return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         self._images.delete(receipt.image_path)
         return FlowResult(step=Step.DISCARDED, message="Discarded. Nothing was saved.")
 
@@ -438,7 +509,7 @@ class ReceiptFlow:
         now = self._clock()
         receipt = self._pending.get(key, now=now)
         if receipt is None:
-            return FlowResult(step=Step.EXPIRED, message="That one is no longer waiting.")
+            return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         receipt.gap_accepted = True
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION, message=summarise(receipt), pending=receipt
@@ -449,7 +520,7 @@ class ReceiptFlow:
         now = self._clock()
         receipt = self._pending.get(key, now=now)
         if receipt is None:
-            return FlowResult(step=Step.EXPIRED, message="That one is no longer waiting.")
+            return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         receipt.merchant_slug = slug
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION, message=summarise(receipt), pending=receipt
@@ -512,6 +583,7 @@ def summarise(receipt: PendingReceipt) -> str:
 
 __all__ = [
     "DATE_FORMATS",
+    "EXPIRED_MESSAGE",
     "FlowConfig",
     "FlowResult",
     "ReceiptFlow",

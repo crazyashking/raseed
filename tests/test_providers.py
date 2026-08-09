@@ -448,6 +448,22 @@ def test_permanent_failures_are_not_retried(code: int) -> None:
     assert len(client.models.calls) == 1
 
 
+def test_a_dropped_connection_is_transient_and_retried() -> None:
+    """A DNS failure is `httpx.ConnectError`, not `errors.APIError`.
+
+    Nothing in the SDK wraps it, so before this it escaped the provider taxonomy
+    outright: no retry, and a raw transport exception delivered to a caller that
+    was only ever told to expect `ProviderError`.
+    """
+    extraction = an_extraction()
+    client = FakeClient(
+        [OSError("[Errno 11001] getaddrinfo failed"), FakeResponse(parsed=extraction, text="{}")]
+    )
+    result = GeminiProvider(client=as_client(client), max_attempts=3).extract(a_request())
+    assert result.extraction == extraction
+    assert len(client.models.calls) == 2
+
+
 def test_the_error_taxonomy_splits_on_retryability() -> None:
     assert isinstance(_translate(api_error(429)), ProviderTransientError)
     assert isinstance(_translate(api_error(500)), ProviderTransientError)

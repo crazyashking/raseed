@@ -24,7 +24,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from conftest import as_extraction_payload
-from raseed.adapters.flow import FlowConfig, ReceiptFlow, Step
+from raseed.adapters.flow import EXPIRED_MESSAGE, FlowConfig, ReceiptFlow, Step
 from raseed.adapters.images import ImageStore
 from raseed.adapters.pending import PendingKey, PendingReceipt, PendingStore
 from raseed.adapters.telegram import (
@@ -396,3 +396,19 @@ def test_a_button_for_an_unknown_receipt_does_not_raise(
     session, _user = seeded
     result = bot.dispatch(session, ACTION_CONFIRM, PendingKey(chat_id=1, message_id=1))
     assert result.step is Step.EXPIRED
+    assert "restarted" in result.message
+
+
+def test_the_expired_message_names_the_cause_and_the_consequence() -> None:
+    """Found live on 2026-08-09.
+
+    Ashrit tapped Confirm on receipts submitted before a restart and got "that
+    one is no longer waiting", which reads like a fault rather than like state
+    that legitimately no longer exists. The wording now says why and says that
+    nothing was saved, without a word about how to send a receipt (invariant 10).
+    """
+    assert "restarted" in EXPIRED_MESSAGE
+    assert "timed out" in EXPIRED_MESSAGE
+    assert "Nothing was saved" in EXPIRED_MESSAGE
+    for coaching in ("crop", "rotate", "as a file", "retake", "clearer", "better"):
+        assert coaching not in EXPIRED_MESSAGE.lower()
