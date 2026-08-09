@@ -915,3 +915,123 @@ def test_confirming_writes_the_misses(seeded: tuple[Session, User], store: Image
 
     terms = sorted(m.term for m in session.scalars(select(LexiconMiss)).all())
     assert terms == ["colgate", "strong", "teeth"]
+
+
+# ---------------------------------------------------------------------------
+# The global cost cap
+# ---------------------------------------------------------------------------
+
+
+def another_user(session: Session) -> User:
+    """A second user, so "everyone" is more than "this one"."""
+    user = User()
+    session.add(user)
+    session.flush()
+    return user
+
+
+def burn(session: Session, user: User, micros: int) -> None:
+    """Spend money on the API without going through the flow."""
+    record_extraction(
+        session,
+        user_id=user.id,
+        result=ProviderResult(
+            extraction=an_extraction(),
+            model_id="gemini-3.6-flash",
+            prompt_version="v1",
+            response_text="{}",
+            input_tokens=1,
+            output_tokens=1,
+            cost_micros_usd=micros,
+        ),
+        source=Source.TELEGRAM_IMAGE,
+        image_sha256=None,
+    )
+    session.commit()
+
+
+def test_one_user_cannot_be_stopped_by_another_users_spend_alone(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The per-user cap is still per user."""
+    session, user = seeded
+    burn(session, another_user(session), 900_000)
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    assert submit(flow, session, user).step is Step.AWAITING_CONFIRMATION
+
+
+def test_the_global_cap_stops_a_user_who_is_inside_their_own(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The bug the global cap exists for.
+
+    Two users, each obediently under their own $1, and the bill is $2. Only a
+    cap that ignores `user_id` can see that.
+    """
+    session, user = seeded
+    burn(session, another_user(session), 900_000)
+    burn(session, user, 900_000)
+
+    flow = make_flow(
+        StubProvider(an_extraction()),
+        store,
+        config=FlowConfig(
+            daily_cost_limit_micros=1_000_000,
+            global_daily_cost_limit_micros=1_500_000,
+        ),
+    )
+    result = submit(flow, session, user)
+    assert result.step is Step.GLOBAL_LIMIT_REACHED
+
+
+def test_the_global_message_does_not_blame_the_user(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """They did nothing wrong, and invariant 10 forbids telling them to change."""
+    session, user = seeded
+    burn(session, another_user(session), 2_000_000)
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    message = submit(flow, session, user).message.lower()
+
+    assert "nothing is wrong on your side" in message
+    assert "your limit" not in message
+
+
+def test_nothing_is_downloaded_or_paid_for_once_the_global_cap_is_hit(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    burn(session, another_user(session), 2_000_000)
+
+    provider = StubProvider(an_extraction())
+    flow = make_flow(provider, store)
+    submit(flow, session, user)
+
+    assert provider.calls == 0
+    assert list(store.root.glob("*")) == []
+
+
+def test_a_deleted_users_spend_still_counts(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Money spent is money spent, whoever spent it and whether they are still here."""
+    session, user = seeded
+    gone = another_user(session)
+    burn(session, gone, 2_000_000)
+    gone.deleted_at = NOW
+    session.commit()
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    assert submit(flow, session, user).step is Step.GLOBAL_LIMIT_REACHED
+
+
+def test_the_global_cap_is_a_rolling_window(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    burn(session, another_user(session), 2_000_000)
+
+    later = make_flow(StubProvider(an_extraction()), store, now=NOW + dt.timedelta(days=2))
+    assert submit(later, session, user).step is Step.AWAITING_CONFIRMATION

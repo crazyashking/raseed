@@ -22,6 +22,7 @@ it is. Invariant 7.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -60,6 +61,8 @@ from raseed.validation.reconcile import (
     reconcile,
 )
 
+log = logging.getLogger(__name__)
+
 #: Formats tried when a receipt prints a date. Anything else falls back to the
 #: message timestamp, and records that it did. Brief 24.4.
 DATE_FORMATS: Final[tuple[str, ...]] = (
@@ -78,8 +81,12 @@ DATE_FORMATS: Final[tuple[str, ...]] = (
 class Step(Enum):
     """Where a receipt ended up."""
 
-    #: The daily API budget is spent. Nothing was downloaded or paid for.
+    #: This user's daily API budget is spent. Nothing was downloaded or paid for.
     LIMIT_REACHED = "limit_reached"
+
+    #: The budget for EVERYBODY is spent. Told apart from `LIMIT_REACHED` because
+    #: the user did nothing wrong and "you have hit your limit" would be a lie.
+    GLOBAL_LIMIT_REACHED = "global_limit_reached"
 
     #: These exact image bytes are already in the ledger.
     DUPLICATE = "duplicate"
@@ -123,6 +130,9 @@ class FlowConfig:
     """Knobs, all of which come from the environment."""
 
     daily_cost_limit_micros: int = 1_000_000
+    #: Across every user. Checked first, because a per-user cap says nothing
+    #: about the total bill once there is more than one user.
+    global_daily_cost_limit_micros: int = 2_000_000
     default_timezone: str = "Asia/Kolkata"
     tolerance_minor: int = DEFAULT_TOLERANCE_MINOR
     min_confidence: float | None = None
@@ -274,16 +284,44 @@ class ReceiptFlow:
         )
 
     def _over_budget(self, session: Session, *, user_id: str, now: dt.datetime) -> bool:
-        """Whether the rolling 24 hour API budget is already spent. Brief 16.6."""
+        """Whether either rolling 24 hour API budget is already spent. Brief 16.6."""
         since = now - dt.timedelta(days=1)
+        if queries.global_spend_micros_since(session, since=since) >= (
+            self._config.global_daily_cost_limit_micros
+        ):
+            return True
         spent = queries.spend_micros_since(session, user_id=user_id, since=since)
         return spent >= self._config.daily_cost_limit_micros
 
     def _check_budget(
         self, session: Session, *, user_id: str, now: dt.datetime
     ) -> FlowResult | None:
-        """Brief 16.6. Refuse before spending, not after."""
-        if not self._over_budget(session, user_id=user_id, now=now):
+        """Brief 16.6. Refuse before spending, not after.
+
+        The global cap is checked first and reported differently. A user who has
+        read two receipts today has not hit *their* limit, and telling them they
+        have would be a lie about their own account.
+        """
+        since = now - dt.timedelta(days=1)
+
+        everyone = queries.global_spend_micros_since(session, since=since)
+        if everyone >= self._config.global_daily_cost_limit_micros:
+            log.warning(
+                "global daily cap reached: %d of %d micro-dollars spent",
+                everyone,
+                self._config.global_daily_cost_limit_micros,
+            )
+            return FlowResult(
+                step=Step.GLOBAL_LIMIT_REACHED,
+                message=(
+                    "Raseed has hit its total reading budget for today, so I did "
+                    "not read that one. Nothing is wrong on your side. It resets "
+                    "on a rolling 24 hour window."
+                ),
+            )
+
+        spent = queries.spend_micros_since(session, user_id=user_id, since=since)
+        if spent < self._config.daily_cost_limit_micros:
             return None
         return FlowResult(
             step=Step.LIMIT_REACHED,

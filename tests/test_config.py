@@ -35,8 +35,14 @@ ENV_VARS = (
     "DEFAULT_TIMEZONE",
     "RECONCILIATION_TOLERANCE_MINOR",
     "DAILY_COST_LIMIT_USD",
+    "GLOBAL_DAILY_COST_LIMIT_USD",
+    "USER_ID_SECRET",
+    "DASHBOARD_PUBLIC_URL",
     "LOG_LEVEL",
 )
+
+#: Long enough to pass the length floor. Not a real secret; nothing signs with it.
+SECRET = "0" * 32
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +149,7 @@ def test_settings_load_from_a_dotenv_file(tmp_path: Path) -> None:
     env.write_text(
         "TELEGRAM_BOT_TOKEN=t\n"
         "TELEGRAM_ALLOWED_USER_IDS=4242\n"
+        f"USER_ID_SECRET={SECRET}\n"
         "GEMINI_API_KEY=k\n"
         "DAILY_COST_LIMIT_USD=0.75\n",
         encoding="utf-8",
@@ -152,6 +159,8 @@ def test_settings_load_from_a_dotenv_file(tmp_path: Path) -> None:
     assert settings.telegram_allowed_user_ids == frozenset({4242})
     assert settings.daily_cost_limit_micros == 750_000
     assert settings.gemini_model == "gemini-3.6-flash"
+    assert settings.global_daily_cost_limit_micros == 2_000_000
+    assert settings.dashboard_public_url == ""
     assert settings.default_timezone == "Asia/Kolkata"
 
 
@@ -175,9 +184,11 @@ def test_secrets_stay_out_of_the_repr(tmp_path: Path) -> None:
     """A traceback or a log line must not print the bot token or the API key."""
     env = tmp_path / ".env"
     env.write_text(
-        "TELEGRAM_BOT_TOKEN=sekrit-token\nGEMINI_API_KEY=sekrit-key\n",
+        "TELEGRAM_BOT_TOKEN=sekrit-token\nGEMINI_API_KEY=sekrit-key\n"
+        "USER_ID_SECRET=sekrit-derivation-key-long-enough-to-pass\n",
         encoding="utf-8",
     )
     text = repr(Settings.from_env(dotenv_path=env))
     assert "sekrit-token" not in text
     assert "sekrit-key" not in text
+    assert "sekrit-derivation" not in text, "the id secret is a secret too"

@@ -29,10 +29,20 @@ PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
 #: the gate that uses it, in `raseed.validation.reconcile`. Brief section 18.4.
 DEFAULT_RECONCILIATION_TOLERANCE_MINOR: Final[int] = DEFAULT_TOLERANCE_MINOR
 
-#: One dollar a day. Brief section 16.6. Held in integer micro-dollars because
-#: it is compared against summed `cost_micros_usd`, which are integers, and
-#: because a budget that drifts by a rounding error is not a budget.
+#: One dollar a day, per user. Brief section 16.6. Held in integer micro-dollars
+#: because it is compared against summed `cost_micros_usd`, which are integers,
+#: and because a budget that drifts by a rounding error is not a budget.
 DEFAULT_DAILY_COST_LIMIT_MICROS: Final[int] = MICROS_PER_USD
+
+#: Two dollars a day, across everybody. The per-user cap does not bound the bill:
+#: N users each stay under their own limit and the total is N times it.
+#:
+#: Sized against the real plan rather than a round number. Live cost is $0.0246
+#: per receipt (measured 2026-08-08), so $2.00 is about 80 receipts a day across
+#: all users, and the expected use is two friends at 10 to 15 receipts each,
+#: **once**. This is a runaway guard, not a quota: it exists so a loop or a
+#: spammer costs $2 rather than a month of Gemini billing.
+DEFAULT_GLOBAL_DAILY_COST_LIMIT_MICROS: Final[int] = 2 * MICROS_PER_USD
 
 
 class ConfigError(RuntimeError):
@@ -43,6 +53,24 @@ def _require(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
         msg = f"{name} is not set. Copy .env.example to .env and fill it in."
+        raise ConfigError(msg)
+    return value
+
+
+#: Shortest `USER_ID_SECRET` accepted. 32 characters of hex is 128 bits, and a
+#: short secret here is not a weak password, it is a secret an attacker with the
+#: database can brute force to recover the list of Telegram accounts using it.
+MIN_SECRET_LENGTH: Final[int] = 32
+
+
+def _secret(name: str) -> str:
+    """A required secret, with a length floor and a loud message when it is short."""
+    value = _require(name)
+    if len(value) < MIN_SECRET_LENGTH:
+        msg = (
+            f"{name} must be at least {MIN_SECRET_LENGTH} characters. "
+            'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
+        )
         raise ConfigError(msg)
     return value
 
@@ -88,6 +116,22 @@ def _usd_micros(name: str, default_micros: int) -> int:
     return int(micros)
 
 
+def _https_url(name: str) -> str:
+    """An optional public URL, which must be HTTPS if it is set at all.
+
+    Refused rather than warned about. Telegram will not open a Mini App over
+    plain HTTP, so an `http://` value here is not a weaker setup, it is a
+    non-working one that fails much later and much less clearly.
+    """
+    value = os.environ.get(name, "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.startswith("https://"):
+        msg = f"{name} must start with https://, got {value!r}. Telegram requires TLS."
+        raise ConfigError(msg)
+    return value
+
+
 def _int_set(name: str) -> frozenset[int]:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -111,6 +155,10 @@ class Settings:
 
     telegram_bot_token: str = field(repr=False)
     telegram_allowed_user_ids: frozenset[int]
+    #: Derives each person's `user_id` from their Telegram account, so no
+    #: external identifier is stored anywhere (invariant 3). See
+    #: `raseed.identity`. **Changing this orphans every existing ledger.**
+    user_id_secret: str = field(repr=False)
     gemini_api_key: str = field(repr=False)
     gemini_model: str
     #: Stage 2's model, which does not have to be Stage 1's. Categorizing short
@@ -122,6 +170,14 @@ class Settings:
     default_timezone: str
     reconciliation_tolerance_minor: int
     daily_cost_limit_micros: int
+    #: Across every user. Checked before the per-user cap, because the whole
+    #: point of it is that one user staying inside their own budget says nothing
+    #: about the total.
+    global_daily_cost_limit_micros: int
+    #: The public HTTPS address the Cloudflare Tunnel serves, or empty. Telegram
+    #: will not open a Mini App over plain HTTP or at 127.0.0.1, so while this is
+    #: empty the bot hands over a loopback link instead of a button.
+    dashboard_public_url: str
     log_level: str
 
     @classmethod
@@ -135,6 +191,7 @@ class Settings:
         return cls(
             telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
             telegram_allowed_user_ids=_int_set("TELEGRAM_ALLOWED_USER_IDS"),
+            user_id_secret=_secret("USER_ID_SECRET"),
             gemini_api_key=_require("GEMINI_API_KEY"),
             gemini_model=_optional("GEMINI_MODEL", "gemini-3.6-flash"),
             gemini_categorizer_model=_optional(
@@ -150,5 +207,9 @@ class Settings:
             daily_cost_limit_micros=_usd_micros(
                 "DAILY_COST_LIMIT_USD", DEFAULT_DAILY_COST_LIMIT_MICROS
             ),
+            global_daily_cost_limit_micros=_usd_micros(
+                "GLOBAL_DAILY_COST_LIMIT_USD", DEFAULT_GLOBAL_DAILY_COST_LIMIT_MICROS
+            ),
+            dashboard_public_url=_https_url("DASHBOARD_PUBLIC_URL"),
             log_level=_optional("LOG_LEVEL", "INFO").upper(),
         )

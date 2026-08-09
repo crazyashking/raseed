@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable
 from typing import Final
 
 from sqlalchemy.orm import Session, sessionmaker
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -39,7 +39,9 @@ from telegram.ext import (
 from raseed.adapters.flow import FlowResult, ReceiptFlow, Step, rupees
 from raseed.adapters.pending import PendingKey, PendingReceipt
 from raseed.db import ledger, queries
+from raseed.db.models import User
 from raseed.db.seed import bootstrap
+from raseed.identity import user_id_for
 from raseed.validation.reconcile import Outcome
 
 log = logging.getLogger(__name__)
@@ -112,8 +114,15 @@ class RaseedBot:
         flow: The transport-agnostic pipeline.
         session_factory: Opens a database session per update.
         allowed_user_ids: Telegram numeric IDs permitted to use this bot. Empty
-            admits nobody, which is the safe default for a single-user bot.
+            admits nobody, which is the safe default. This is the whole invite
+            mechanism: adding a friend is adding their number here.
         clock: Injected so tests do not depend on wall time.
+        user_id_secret: Derives each person's `user_id` from their Telegram ID.
+            See `raseed.identity`. Never stored, and must never change.
+        dashboard_url: The loopback address, for when there is no public one.
+        public_url: The Cloudflare Tunnel address. Its presence is what turns
+            `/dashboard` into a Mini App button, which is the only form that
+            carries the signed `initData` the dashboard authenticates with.
     """
 
     def __init__(
@@ -123,13 +132,17 @@ class RaseedBot:
         session_factory: sessionmaker[Session],
         allowed_user_ids: frozenset[int],
         clock: Callable[[], dt.datetime],
+        user_id_secret: str,
         dashboard_url: str | None = None,
+        public_url: str = "",
     ) -> None:
         self._flow = flow
         self._sessions = session_factory
         self._allowed = allowed_user_ids
         self._clock = clock
+        self._secret = user_id_secret
         self._dashboard_url = dashboard_url
+        self._public_url = public_url
 
     # -- access control ------------------------------------------------------
 
@@ -139,6 +152,20 @@ class RaseedBot:
         if user is None:
             return False
         return user.id in self._allowed
+
+    def owner(self, session: Session, update: Update) -> User | None:
+        """The ledger this update belongs to, created on first sight.
+
+        Derived per person, so a friend's first photo is also their signup and
+        two people never share a ledger. Returns None when the update carries no
+        user at all, which a caller must treat as "do nothing" rather than as
+        "use the default account": the old code called `bootstrap(session)` with
+        no argument and would have handed friend number two the owner's ledger.
+        """
+        user = update.effective_user
+        if user is None:
+            return None
+        return bootstrap(session, user_id_for(user.id, secret=self._secret))
 
     # -- handlers ------------------------------------------------------------
 
@@ -177,7 +204,9 @@ class RaseedBot:
             return
 
         with self._sessions() as session:
-            owner = bootstrap(session)
+            owner = self.owner(session, update)
+            if owner is None:
+                return
             result = self._flow.submit_image(
                 session,
                 user_id=owner.id,
@@ -204,7 +233,9 @@ class RaseedBot:
             return
 
         with self._sessions() as session:
-            owner = bootstrap(session)
+            owner = self.owner(session, update)
+            if owner is None:
+                return
             result = self.dispatch(session, action, key)
             session.commit()
 
@@ -238,7 +269,9 @@ class RaseedBot:
         if not self.permitted(update) or update.message is None:
             return
         with self._sessions() as session:
-            owner = bootstrap(session)
+            owner = self.owner(session, update)
+            if owner is None:
+                return
             rows = queries.recent_transactions(session, user_id=owner.id)
             session.commit()
 
@@ -252,15 +285,30 @@ class RaseedBot:
         await update.message.reply_text("\n".join(lines))
 
     async def dashboard(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Hand over the dashboard link.
+        """Open the dashboard.
 
-        A plain message rather than an inline button, because Telegram will not
-        render a URL button for `http://127.0.0.1`: it demands https and a real
-        host. That is the correct restriction and not one to work around. When
-        the dashboard gets a public HTTPS address, this becomes a button and the
-        authentication lands in the same change.
+        A Mini App button when there is a public HTTPS address, because that is
+        what carries the signed `initData` the dashboard authenticates with. A
+        plain link otherwise: Telegram refuses to render a button for
+        `http://127.0.0.1`, which is the correct restriction and not one to work
+        around, and the loopback dashboard is only reachable from this machine
+        anyway.
         """
         if not self.permitted(update) or update.message is None:
+            return
+        if self._public_url:
+            await update.message.reply_text(
+                "Your dashboard:",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "Open dashboard", web_app=WebAppInfo(url=self._public_url)
+                            )
+                        ]
+                    ]
+                ),
+            )
             return
         if self._dashboard_url is None:
             await update.message.reply_text("The dashboard is not running in this process.")
@@ -272,7 +320,9 @@ class RaseedBot:
         if not self.permitted(update) or update.message is None:
             return
         with self._sessions() as session:
-            owner = bootstrap(session)
+            owner = self.owner(session, update)
+            if owner is None:
+                return
             rows = queries.recent_transactions(session, user_id=owner.id, limit=1)
             if not rows:
                 session.commit()

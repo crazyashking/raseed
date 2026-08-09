@@ -77,6 +77,25 @@ def spend_micros_since(session: Session, *, user_id: str, since: dt.datetime) ->
     return int(total or 0)
 
 
+def global_spend_micros_since(session: Session, *, since: dt.datetime) -> int:
+    """API spend across every user since a moment, in micro-dollars.
+
+    The per-user cap does not bound the bill. Five users each obediently under
+    $1 a day is $5 a day, and the account that gets billed is one account. This
+    is the only number that says what the whole thing can cost.
+
+    Deliberately not filtered by user, and deliberately not summed from
+    `spend_micros_since` per user: a user who is not in the allowlist any more,
+    or was never seen again, still spent real money and it still counts.
+    """
+    total = session.scalar(
+        select(func.coalesce(func.sum(RawExtraction.cost_micros_usd), 0)).where(
+            RawExtraction.created_at >= since
+        )
+    )
+    return int(total or 0)
+
+
 def recent_transactions(session: Session, *, user_id: str, limit: int = 10) -> list[Transaction]:
     """The newest rows, for `/recent` and `/undo`. Brief section 16.3."""
     return list(

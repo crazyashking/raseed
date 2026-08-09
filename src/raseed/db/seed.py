@@ -16,12 +16,35 @@ from sqlalchemy.orm import Session
 from raseed.db.models import SEED_CATEGORIES, UNCATEGORIZED_SLUG, Category, User
 
 
-def ensure_user(session: Session) -> User:
-    """Return the single user, creating it if the ledger is empty.
+def ensure_user(session: Session, user_id: str | None = None) -> User:
+    """Return a user, creating the row if this is the first time they are seen.
 
-    There is exactly one user for now, and `user_id` is on every table so that
-    stays true without a migration when it stops being one.
+    Args:
+        user_id: The derived ID from `raseed.identity.user_id_for`. Passing it is
+            how a second person gets a second ledger rather than landing in
+            somebody else's. Omitted only by tools and tests that predate
+            multiple users, where it keeps the old "the single user" behaviour.
+
+    A user row holds no identifier of its own (invariant 3). The ID is derived
+    from the Telegram account outside the database and handed in, so nothing here
+    ever learns whose it is.
     """
+    if user_id is not None:
+        user = session.get(User, user_id)
+        if user is not None:
+            # A soft-deleted user coming back is the same person with the same
+            # history. Undeleting is the correct reading of invariant 2 here:
+            # the row is restored, nothing is rewritten.
+            if user.deleted_at is not None:
+                user.deleted_at = None
+                session.flush()
+            return user
+
+        user = User(id=user_id)
+        session.add(user)
+        session.flush()
+        return user
+
     user = session.scalars(select(User).where(User.deleted_at.is_(None)).limit(1)).first()
     if user is not None:
         return user
@@ -70,9 +93,14 @@ def uncategorized(session: Session, user_id: str) -> Category:
     return category
 
 
-def bootstrap(session: Session) -> User:
-    """Make a freshly migrated database usable. Idempotent."""
-    user = ensure_user(session)
+def bootstrap(session: Session, user_id: str | None = None) -> User:
+    """Make a ledger usable for one user. Idempotent, and cheap to call per update.
+
+    Called on every inbound message, which is what makes a friend's first photo
+    also their signup: they get a user row and the five seed categories, and
+    nothing had to be provisioned in advance.
+    """
+    user = ensure_user(session, user_id)
     ensure_categories(session, user.id)
     return user
 

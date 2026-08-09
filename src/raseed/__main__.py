@@ -72,6 +72,7 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Sessi
         pending=PendingStore(),
         config=FlowConfig(
             daily_cost_limit_micros=settings.daily_cost_limit_micros,
+            global_daily_cost_limit_micros=settings.global_daily_cost_limit_micros,
             default_timezone=settings.default_timezone,
             tolerance_minor=settings.reconciliation_tolerance_minor,
         ),
@@ -82,6 +83,8 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Sessi
         session_factory=sessions,
         allowed_user_ids=settings.telegram_allowed_user_ids,
         clock=now_utc,
+        user_id_secret=settings.user_id_secret,
+        public_url=settings.dashboard_public_url,
         dashboard_url=f"http://{web.HOST}:{web.DEFAULT_PORT}/",
     )
     return bot, images, sessions
@@ -115,9 +118,17 @@ def main() -> int:
 
     bot, images, sessions = build(settings)
 
-    # Loopback only. See `web/server.py`: this is not reachable off the machine,
-    # and it does not become reachable without authentication landing with it.
-    web.serve(session_factory=sessions, clock=now_utc, port=web.DEFAULT_PORT)
+    # Still bound to loopback, and more deliberately now that there is a public
+    # address: Cloudflare Tunnel dials out to this socket, so nothing listens on
+    # a public interface and no port is forwarded. Every page behind `/` requires
+    # a signed Telegram `initData`.
+    web.serve(
+        session_factory=sessions,
+        clock=now_utc,
+        bot_token=settings.telegram_bot_token,
+        user_id_secret=settings.user_id_secret,
+        port=web.DEFAULT_PORT,
+    )
 
     # A crash between extraction and confirm strands an image on disk, and the
     # pending store that knew about it lives in memory. Invariant 7.

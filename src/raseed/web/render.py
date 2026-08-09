@@ -338,4 +338,93 @@ def not_found() -> str:
     )
 
 
-__all__ = ["CHART_HEIGHT", "STYLE", "dashboard", "not_found", "page", "receipt_page"]
+def locked() -> str:
+    """What an unauthenticated request gets.
+
+    Says nothing about whether the ledger exists, how many users there are, or
+    who this instance belongs to. Someone who found the URL learns only that
+    they need to come through the bot.
+    """
+    return page(
+        "Raseed",
+        "<header><h1>Raseed</h1></header>"
+        '<div class="card"><div class="empty">'
+        "Open this from the Raseed bot in Telegram."
+        "</div></div>",
+    )
+
+
+#: The only JavaScript in this project, and it exists because of one constraint:
+#: a Mini App proves who it is with a blob that only the browser can read, so the
+#: first request cannot be the page itself.
+#:
+#: There is no cookie and no session. Every request carries the signed `initData`
+#: in an `Authorization` header, so there is nothing on the server to expire,
+#: nothing to steal from storage, and no CSRF surface, because a forged
+#: cross-site request cannot attach a header it does not have.
+_BOOT = """
+(function () {
+  var app = window.Telegram && window.Telegram.WebApp;
+  if (app) { app.ready(); app.expand(); }
+  var auth = app && app.initData ? 'tma ' + app.initData : '';
+  if (!auth) { document.body.textContent = 'Open this from the Raseed bot in Telegram.'; return; }
+
+  function show(html) {
+    document.open(); document.write(html); document.close();
+    wire();
+  }
+
+  function go(url) {
+    fetch(url, { headers: { Authorization: auth } })
+      .then(function (r) { return r.text(); })
+      .then(show)
+      .catch(function () {
+        document.body.textContent = 'Could not reach Raseed. Try again in a moment.';
+      });
+  }
+
+  function wire() {
+    document.addEventListener('click', function (e) {
+      var a = e.target.closest ? e.target.closest('a[href^="/"]') : null;
+      if (!a) { return; }
+      e.preventDefault();
+      go(a.getAttribute('href'));
+    });
+  }
+
+  go('/app');
+})();
+"""
+
+
+def shell() -> str:
+    """The page Telegram opens, before anything is known about who opened it.
+
+    Carries no ledger data at all. It loads Telegram's SDK, reads the signed
+    `initData` the SDK exposes, and fetches the real page with it. Anyone who
+    hits this URL without Telegram gets a page with nothing in it.
+    """
+    return (
+        "<!doctype html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Raseed</title>"
+        f"<style>{STYLE}</style>"
+        '<script src="https://telegram.org/js/telegram-web-app.js"></script>'
+        "</head><body>"
+        '<div class="card"><div class="empty">Loading.</div></div>'
+        f"<script>{_BOOT}</script>"
+        "</body></html>"
+    )
+
+
+__all__ = [
+    "CHART_HEIGHT",
+    "STYLE",
+    "dashboard",
+    "locked",
+    "not_found",
+    "page",
+    "receipt_page",
+    "shell",
+]

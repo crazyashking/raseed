@@ -1294,6 +1294,97 @@ Blinkit prints the trailing form, `500 ml x 2`, in a separate quantity column
 rather than in the title. Both forms are parsed, and the receipt's own quantity
 column is preferred over a size buried in a product name.
 
+### 2026-08-08: user IDs are derived from the Telegram account, never stored
+
+Multiple people need separate ledgers. Every table already carries `user_id`
+(invariant 8), so the only missing piece was turning "Telegram user 123456789"
+into one.
+
+The obvious answer, a column mapping one to the other, is not available.
+Invariant 3 bans PII fields in any schema, a test asserts `users` holds exactly
+`id`, `created_at` and `deleted_at`, and another bans any column name containing
+"telegram". A Telegram account ID identifies a person, and a public repo whose
+schema advertises where that identifier lives is precisely what invariant 3
+exists to prevent.
+
+So the ID is derived:
+
+    user_id = UUID(HMAC-SHA256(USER_ID_SECRET, "telegram:<id>")[:16])
+
+Stable, so someone returns to their own ledger. One way, so a stolen database
+cannot be turned back into a list of Telegram accounts. And there is no mapping
+table, so there is nothing to leak.
+
+**The price, stated plainly: `USER_ID_SECRET` can never change.** Change it and
+every user is a new user with an empty ledger, and the old rows are unreachable
+because nothing anywhere records whose they were. `tools/claim.py` exists for
+exactly that, and it is the only reason the situation is recoverable at all.
+
+The secret is namespaced (`telegram:`) so a second transport later derives a
+different ID for the same number instead of silently colliding.
+
+`tools/claim.py` moves rows between user IDs, which is an UPDATE against
+`raw_extractions`, a table invariant 5 calls immutable. The reading taken:
+invariant 5 protects the *content* of an extraction, what the model saw and
+said. Which ledger a row belongs to is not content, and the alternative to
+moving the rows is abandoning them. It is a one-shot repair tool, run by hand,
+that backs the database up first and refuses to run without an explicit target.
+
+### 2026-08-08: a global cost cap, because N per-user caps do not bound the bill
+
+Brief 16.6's daily cap is per user. Two users each staying inside a $1 budget is
+a $2 day, ten users is a $10 day, and the number that actually gets billed was
+not being checked anywhere.
+
+`GLOBAL_DAILY_COST_LIMIT_USD` defaults to $2.00 and is checked **before** the
+per-user cap, since a total that is already blown is not made acceptable by an
+individual who has been frugal. Both read the same rolling 24 hour window over
+`raw_extractions.cost_micros_usd`, which is where every API call this project
+makes gets priced.
+
+Sized against measurement, not roundness: $0.0246 per receipt live, so $2.00 is
+about 80 receipts a day across everybody, against an expected load of two
+friends at 10 to 15 receipts each, once. It is a runaway guard, not a quota. A
+loop or a spammer costs $2 and stops.
+
+The refusal message names the cause honestly ("Raseed has hit its total reading
+budget for today") and adds "Nothing is wrong on your side", because the user
+who trips a global cap is usually not the user who filled it.
+
+### 2026-08-08: the dashboard authenticates with Telegram's `initData`, in a header
+
+The dashboard was loopback-only and therefore needed no authentication. Once a
+Cloudflare Tunnel points a public HTTPS name at it, that stops being true on the
+first request.
+
+Telegram signs the `initData` blob it hands a Mini App with the bot token, so a
+page opened from the bot can prove which account opened it: no password, no
+session store, no OAuth round trip, no new dependency (stdlib `hmac`).
+Verification is `hmac.compare_digest` over the sorted data-check-string, with a
+one hour freshness window checked in both directions, since a blob dated in the
+future is either a broken clock or someone minting one that never expires.
+
+**Header, not cookie.** `Authorization: tma <initData>` on every request. A
+cookie would mean CSRF reasoning, SameSite reasoning and a logout story, all for
+a read-only app that displays what the viewer already owns. Nothing is stored
+browser-side, so there is nothing to steal from it and nothing to expire.
+
+`/` therefore serves a data-free shell: markup, style, and the only JavaScript
+in this project, which reads `Telegram.WebApp.initData` and fetches the real page
+with the header. An unauthenticated GET of the root reveals that Raseed exists
+and nothing else.
+
+`X-Frame-Options: DENY` had to go, because a Mini App **is** a frame. It is
+replaced by a CSP `frame-ancestors` naming Telegram's two origins, which is
+narrower than what it replaced rather than a relaxation.
+
+Every unknown path answers 401 before it answers 404, so an unauthenticated
+caller cannot map the routes.
+
+`HOST` stays hardcoded to `127.0.0.1`. A Cloudflare Tunnel dials *out* from this
+machine, so the listener never needs to be reachable from the network, and the
+public name resolves to Cloudflare rather than to a home IP address.
+
 ---
 
 ## Still open

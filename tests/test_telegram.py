@@ -44,6 +44,10 @@ NOW = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
 PNG = b"\x89PNG\r\n\x1a\n" + b"receipt-bytes"
 
 ALLOWED_ID = 4242
+
+#: Derives `user_id` from a Telegram ID. Long enough to pass the length floor,
+#: and fixed so the derived IDs are stable across a run.
+SECRET = "test-secret-that-is-long-enough-to-pass"
 STRANGER_ID = 9999
 
 
@@ -118,6 +122,7 @@ def bot(flow: ReceiptFlow) -> RaseedBot:
         session_factory=unbound_sessions(),
         allowed_user_ids=frozenset({ALLOWED_ID}),
         clock=lambda: NOW,
+        user_id_secret=SECRET,
     )
 
 
@@ -146,6 +151,7 @@ def test_an_empty_whitelist_admits_nobody(flow: ReceiptFlow) -> None:
         session_factory=unbound_sessions(),
         allowed_user_ids=frozenset(),
         clock=lambda: NOW,
+        user_id_secret=SECRET,
     )
     assert open_bot.permitted(an_update(ALLOWED_ID)) is False
 

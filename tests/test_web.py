@@ -12,12 +12,16 @@ vision model reading an image, and an image is something a stranger can craft.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
+import json
 import threading
 from collections.abc import Iterator
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytest
@@ -39,6 +43,7 @@ from raseed.db.models import (
 from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ProviderResult
 from raseed.extraction.schemas import ExtractionResult
+from raseed.identity import user_id_for
 from raseed.money import money, rupees
 from raseed.validation.reconcile import reconcile
 from raseed.web import data, render
@@ -46,6 +51,20 @@ from raseed.web.server import Dashboard, handler_for
 
 NOW = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
 TODAY = NOW.date()
+
+#: A fake bot token. Nothing talks to Telegram; this is only the HMAC key that
+#: `initData` is signed and verified with, so any string works as long as both
+#: sides use the same one.
+BOT_TOKEN = "123456:test-token"
+
+#: Derives `user_id`. Long enough to pass the config length floor.
+SECRET = "test-secret-that-is-long-enough-to-pass"
+
+#: The Telegram account whose dashboard the fixture seeds.
+VISITOR_ID = 4242
+
+#: Somebody else, used to prove one user cannot read another's receipts.
+STRANGER_ID = 9999
 
 
 # ---------------------------------------------------------------------------
@@ -491,11 +510,16 @@ def live(tmp_path: Path) -> Iterator[str]:
     factory = sessionmaker(bind=engine)
 
     with factory() as session:
-        user = bootstrap(session)
+        user = bootstrap(session, user_id_for(VISITOR_ID, secret=SECRET))
         store(session, user, on=TODAY)
         session.commit()
 
-    dashboard = Dashboard(session_factory=factory, clock=lambda: NOW)
+    dashboard = Dashboard(
+        session_factory=factory,
+        clock=lambda: NOW,
+        bot_token=BOT_TOKEN,
+        user_id_secret=SECRET,
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(dashboard))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -507,29 +531,50 @@ def live(tmp_path: Path) -> Iterator[str]:
         engine.dispose()
 
 
+def signed_init_data(
+    telegram_id: int = VISITOR_ID, *, token: str = BOT_TOKEN, auth_date: int | None = None
+) -> str:
+    """A Telegram `initData` blob signed the way Telegram signs one.
+
+    Built here rather than pasted from a real session, so the tests exercise the
+    real verification path and nothing has to be stubbed out.
+    """
+    fields = {
+        "auth_date": str(auth_date if auth_date is not None else int(NOW.timestamp())),
+        "query_id": "AAF",
+        "user": json.dumps({"id": telegram_id, "first_name": "Test"}, separators=(",", ":")),
+    }
+    check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret_key, check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def authorised(url: str, init_data: str | None = None) -> Request:
+    return Request(url, headers={"Authorization": f"tma {init_data or signed_init_data()}"})
+
+
 def test_health_answers(live: str) -> None:
     with urlopen(f"{live}/health") as response:
         assert response.status == HTTPStatus.OK
         assert response.read() == b"ok"
 
 
-def test_the_index_renders_over_http(live: str) -> None:
+def test_the_shell_carries_no_ledger_data(live: str) -> None:
+    """`/` is the only unauthenticated page, so it must contain nothing."""
     with urlopen(f"{live}/") as response:
         body = response.read().decode("utf-8")
     assert response.status == HTTPStatus.OK
     assert "Raseed" in body
+    assert "₹" not in body
+    assert "219" not in body
 
 
-def test_an_unknown_path_is_a_404(live: str) -> None:
-    with pytest.raises(HTTPError) as caught:
-        urlopen(f"{live}/nope")
-    assert caught.value.code == HTTPStatus.NOT_FOUND
-
-
-def test_an_unknown_receipt_is_a_404(live: str) -> None:
-    with pytest.raises(HTTPError) as caught:
-        urlopen(f"{live}/receipt/does-not-exist")
-    assert caught.value.code == HTTPStatus.NOT_FOUND
+def test_the_dashboard_renders_for_a_signed_visitor(live: str) -> None:
+    with urlopen(authorised(f"{live}/app")) as response:
+        body = response.read().decode("utf-8")
+    assert response.status == HTTPStatus.OK
+    assert "₹219.00" in body
 
 
 def test_the_dashboard_refuses_writes(live: str) -> None:
@@ -542,7 +587,117 @@ def test_the_dashboard_refuses_writes(live: str) -> None:
 def test_security_headers_are_set(live: str) -> None:
     with urlopen(f"{live}/") as response:
         headers = dict(response.headers)
-    assert headers["X-Frame-Options"] == "DENY"
     assert headers["X-Content-Type-Options"] == "nosniff"
-    assert headers["Cache-Control"] == "no-store"
-    assert "default-src 'none'" in headers["Content-Security-Policy"]
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert "private" in headers["Cache-Control"]
+
+    policy = headers["Content-Security-Policy"]
+    assert "default-src 'none'" in policy
+    # Named ancestors rather than DENY: a Mini App lives in Telegram's frame,
+    # and only Telegram's.
+    assert "frame-ancestors https://web.telegram.org https://telegram.org" in policy
+    assert "form-action 'none'" in policy
+
+
+# ---------------------------------------------------------------------------
+# Authentication (Telegram Mini App initData)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/app", "/receipt/anything", "/nope"])
+def test_every_page_but_the_shell_needs_proof(live: str, path: str) -> None:
+    """Including an unknown path. A stranger cannot map the routes by 404s."""
+    with pytest.raises(HTTPError) as caught:
+        urlopen(f"{live}{path}")
+    assert caught.value.code == HTTPStatus.UNAUTHORIZED
+
+
+def test_a_blob_signed_with_the_wrong_token_is_refused(live: str) -> None:
+    """The signature is over the bot token. Anyone else's bot proves nothing."""
+    forged = signed_init_data(token="999:someone-elses-bot")
+    with pytest.raises(HTTPError) as caught:
+        urlopen(authorised(f"{live}/app", forged))
+    assert caught.value.code == HTTPStatus.UNAUTHORIZED
+
+
+def test_a_tampered_blob_is_refused(live: str) -> None:
+    """Changing the user ID after signing must not survive."""
+    tampered = signed_init_data().replace("4242", "9999")
+    with pytest.raises(HTTPError) as caught:
+        urlopen(authorised(f"{live}/app", tampered))
+    assert caught.value.code == HTTPStatus.UNAUTHORIZED
+
+
+def test_a_stale_blob_is_refused(live: str) -> None:
+    old = signed_init_data(auth_date=int(NOW.timestamp()) - 7200)
+    with pytest.raises(HTTPError) as caught:
+        urlopen(authorised(f"{live}/app", old))
+    assert caught.value.code == HTTPStatus.UNAUTHORIZED
+
+
+def test_the_wrong_scheme_is_refused(live: str) -> None:
+    request = Request(f"{live}/app", headers={"Authorization": f"Bearer {signed_init_data()}"})
+    with pytest.raises(HTTPError) as caught:
+        urlopen(request)
+    assert caught.value.code == HTTPStatus.UNAUTHORIZED
+
+
+def test_the_refusal_says_nothing(live: str) -> None:
+    """It must not confirm the ledger exists or say which check failed."""
+    with pytest.raises(HTTPError) as caught:
+        urlopen(f"{live}/app")
+    body = caught.value.read().decode("utf-8")
+    assert "Open this from the Raseed bot" in body
+    assert "₹" not in body
+    assert "signature" not in body.lower()
+
+
+def test_health_needs_no_proof(live: str) -> None:
+    """The tunnel and any uptime check need it, and it reveals nothing."""
+    with urlopen(f"{live}/health") as response:
+        assert response.read() == b"ok"
+
+
+# ---------------------------------------------------------------------------
+# One user cannot read another's ledger
+# ---------------------------------------------------------------------------
+
+
+def test_a_stranger_gets_their_own_empty_dashboard(live: str) -> None:
+    """The bug this whole change exists to prevent.
+
+    Before per-user IDs the dashboard rendered "the first user in the table",
+    so the second person to open the link would have seen the owner's spending.
+    """
+    stranger = signed_init_data(STRANGER_ID)
+    with urlopen(authorised(f"{live}/app", stranger)) as response:
+        body = response.read().decode("utf-8")
+    assert "₹219.00" not in body
+    assert "₹0.00" in body
+
+
+def test_a_stranger_cannot_open_someone_elses_receipt(live: str) -> None:
+    """Guessing a transaction ID is not enough, because the query is scoped."""
+    with urlopen(authorised(f"{live}/app")) as response:
+        mine = response.read().decode("utf-8")
+    transaction_id = mine.split('href="/receipt/', 1)[1].split('"', 1)[0]
+
+    with pytest.raises(HTTPError) as caught:
+        urlopen(authorised(f"{live}/receipt/{transaction_id}", signed_init_data(STRANGER_ID)))
+    assert caught.value.code == HTTPStatus.NOT_FOUND
+
+
+def test_the_same_account_always_lands_on_the_same_ledger() -> None:
+    """Derived, not stored, so it has to be a pure function of the account."""
+    assert user_id_for(VISITOR_ID, secret=SECRET) == user_id_for(VISITOR_ID, secret=SECRET)
+    assert user_id_for(VISITOR_ID, secret=SECRET) != user_id_for(STRANGER_ID, secret=SECRET)
+
+
+def test_a_different_secret_is_a_different_ledger() -> None:
+    """The stated cost of not storing the identifier. See raseed/identity.py."""
+    assert user_id_for(VISITOR_ID, secret=SECRET) != user_id_for(VISITOR_ID, secret="x" * 32)
+
+
+def test_the_derived_id_does_not_contain_the_account_number() -> None:
+    """The whole reason it is an HMAC and not a formatted string."""
+    assert str(VISITOR_ID) not in user_id_for(VISITOR_ID, secret=SECRET)
