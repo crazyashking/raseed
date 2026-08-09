@@ -32,7 +32,22 @@ from raseed.adapters.pending import (
 )
 from raseed.db import queries
 from raseed.db.ledger import NotStorableError, record_extraction, record_transaction
-from raseed.db.models import DateSource, RawExtraction, Source, Transaction, User
+from raseed.db.models import (
+    CategorySource,
+    DateSource,
+    ExtractionStage,
+    LexiconMiss,
+    RawExtraction,
+    Source,
+    Transaction,
+    TransactionLineItem,
+    User,
+)
+from raseed.enrichment.providers.base import (
+    CategorizationProviderResult,
+    CategorizationRequest,
+)
+from raseed.enrichment.schemas import CategorizationResult, ItemCategory
 from raseed.extraction.providers.base import (
     ExtractionRequest,
     ProviderResult,
@@ -83,12 +98,37 @@ def store(tmp_path: Path) -> ImageStore:
     return ImageStore(tmp_path / "incoming")
 
 
+class StubCategorizer:
+    """Stage 2's model, which must never be reached for a known product."""
+
+    def __init__(self, answers: list[ItemCategory] | None = None) -> None:
+        self.answers = answers or []
+        self.calls = 0
+
+    @property
+    def model_id(self) -> str:
+        return "gemini-3.5-flash-lite"
+
+    def categorize(self, _request: CategorizationRequest) -> CategorizationProviderResult:
+        self.calls += 1
+        return CategorizationProviderResult(
+            categorization=CategorizationResult(items=self.answers),
+            model_id=self.model_id,
+            prompt_version="categorize-v1",
+            response_text="{}",
+            input_tokens=300,
+            output_tokens=40,
+            cost_micros_usd=95,
+        )
+
+
 def make_flow(
     provider: StubProvider,
     store: ImageStore,
     *,
     now: dt.datetime = NOW,
     config: FlowConfig | None = None,
+    categorizer: StubCategorizer | None = None,
 ) -> ReceiptFlow:
     return ReceiptFlow(
         provider=provider,
@@ -96,6 +136,7 @@ def make_flow(
         pending=PendingStore(),
         config=config or FlowConfig(),
         clock=lambda: now,
+        categorizer=categorizer,
     )
 
 
@@ -393,7 +434,6 @@ def test_the_ledger_refuses_a_class_1_extraction(seeded: tuple[Session, User]) -
     with pytest.raises(NotStorableError, match="class_1"):
         record_transaction(
             session,
-            user_id=user.id,
             raw=raw,
             reconciliation=reconcile(extraction),
             occurred_on_local=dt.date(2026, 8, 8),
@@ -697,3 +737,181 @@ def test_the_summary_shows_the_items_and_the_total(
     assert "FLAT100 Promo Code" in text
     assert "₹339.00" in text
     assert "Saved ₹56.00 against MRP" in text
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 on confirm (brief 4.5 and 18.5)
+# ---------------------------------------------------------------------------
+
+
+def confirm_one(flow: ReceiptFlow, session: Session, user: User) -> list[TransactionLineItem]:
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+    result = flow.confirm(session, pending.key)
+    session.commit()
+    assert result.transaction is not None
+    return list(
+        session.scalars(
+            select(TransactionLineItem)
+            .where(TransactionLineItem.transaction_id == result.transaction.id)
+            .order_by(TransactionLineItem.position)
+        ).all()
+    )
+
+
+def test_confirming_categorizes_the_line_items(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    items = confirm_one(make_flow(StubProvider(an_extraction()), store), session, user)
+
+    assert len(items) == 6
+    assert all(item.category_id is not None for item in items)
+    assert all(item.category_source is CategorySource.LEXICON_EXACT for item in items)
+    assert [item.canonical_slug for item in items] == [
+        "milk",
+        "bread",
+        "onion",
+        "potato",
+        "tomato",
+        "coriander",
+    ]
+    assert [item.normalized_slug for item in items] == [
+        "amul-taaza-toned-milk",
+        "britannia-brown-bread",
+        "fresho-pyaz-onion",
+        "aalu-potato",
+        "desi-tamatar",
+        "dhaniya-coriander-leaves",
+    ]
+    # `Fresho Pyaz / Onion` carries no size in its name at all. Its 1 kg comes
+    # from the receipt's own quantity column, which is why that column is read
+    # in preference to the title.
+    assert [item.quantity for item in items] == [500, 400, 1000, 1000, 500, 100]
+    assert [item.unit_normalized for item in items] == ["ml", "g", "g", "g", "g", "g"]
+    # "500 ml x 2" is two units of 500 ml, not a 1 L bottle.
+    assert [item.pack_count for item in items] == [2, 1, 1, 1, 1, 1]
+
+
+def test_a_known_receipt_never_reaches_the_stage_two_model(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The whole point of brief 4.5. Most receipts must cost nothing to categorize."""
+    session, user = seeded
+    categorizer = StubCategorizer()
+    confirm_one(
+        make_flow(StubProvider(an_extraction()), store, categorizer=categorizer), session, user
+    )
+    assert categorizer.calls == 0
+
+
+def test_stage_two_runs_on_confirm_not_on_submit(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A discarded receipt must not cost anything to categorize."""
+    session, user = seeded
+    categorizer = StubCategorizer(
+        answers=[ItemCategory(index=0, category="groceries", confidence=0.9)]
+    )
+    flow = make_flow(StubProvider(an_extraction("blinkit_032")), store, categorizer=categorizer)
+
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+    assert categorizer.calls == 0
+
+    flow.discard(pending.key)
+    assert categorizer.calls == 0
+
+
+def test_the_stage_two_call_is_billed_to_the_same_cap(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A Stage 2 row lands in `raw_extractions`, marked as Stage 2. Brief 16.6."""
+    session, user = seeded
+    unknown = an_extraction(
+        line_items=[
+            {
+                "raw_name": "Colgate Strong Teeth",
+                "quantity_text": None,
+                "mrp_minor": None,
+                "line_total_minor": 21900,
+            }
+        ]
+    )
+    categorizer = StubCategorizer(
+        answers=[ItemCategory(index=0, category="groceries", confidence=0.88)]
+    )
+    items = confirm_one(
+        make_flow(StubProvider(unknown), store, categorizer=categorizer), session, user
+    )
+
+    assert categorizer.calls == 1
+    assert items[0].category_source is CategorySource.LLM
+    assert items[0].category_confidence_bp == 8800
+
+    rows = session.scalars(
+        select(RawExtraction).where(RawExtraction.stage == ExtractionStage.CATEGORIZATION)
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].cost_micros_usd == 95
+    assert (
+        queries.spend_micros_since(session, user_id=user.id, since=NOW - dt.timedelta(days=1))
+        == 12_555 + 95
+    )
+
+
+def test_the_fallback_is_skipped_when_the_budget_is_gone(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Being over budget must never cost the user the receipt.
+
+    The submission is paid for while there is budget. By confirm time the cap
+    has been reached, so the lexicon still runs and the model does not.
+    """
+    session, user = seeded
+    unknown = an_extraction(
+        line_items=[
+            {
+                "raw_name": "Colgate Strong Teeth",
+                "quantity_text": None,
+                "mrp_minor": None,
+                "line_total_minor": 21900,
+            }
+        ]
+    )
+    categorizer = StubCategorizer()
+    flow = make_flow(
+        StubProvider(unknown),
+        store,
+        categorizer=categorizer,
+        # Below what Stage 1 costs, so the submission passes the check at zero
+        # spend and the cap is already gone by the time confirm runs.
+        config=FlowConfig(daily_cost_limit_micros=1_000),
+    )
+
+    pending = submit(flow, session, user).pending
+    assert pending is not None, "the submission itself was within budget"
+
+    result = flow.confirm(session, pending.key)
+    session.commit()
+
+    assert categorizer.calls == 0
+    assert result.transaction is not None, "the receipt still lands"
+
+
+def test_confirming_writes_the_misses(seeded: tuple[Session, User], store: ImageStore) -> None:
+    session, user = seeded
+    unknown = an_extraction(
+        line_items=[
+            {
+                "raw_name": "Colgate Strong Teeth",
+                "quantity_text": None,
+                "mrp_minor": None,
+                "line_total_minor": 21900,
+            }
+        ]
+    )
+    confirm_one(make_flow(StubProvider(unknown), store), session, user)
+
+    terms = sorted(m.term for m in session.scalars(select(LexiconMiss)).all())
+    assert terms == ["colgate", "strong", "teeth"]

@@ -27,12 +27,24 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from raseed.adapters.images import ImageStore
 from raseed.adapters.pending import PendingKey, PendingReceipt, PendingStore
 from raseed.db import ledger, queries
-from raseed.db.models import DateSource, RawExtraction, Source, Transaction
+from raseed.db.models import (
+    UNCATEGORIZED_SLUG,
+    Category,
+    DateSource,
+    RawExtraction,
+    Source,
+    Transaction,
+)
+from raseed.enrichment.categorize import Item as Stage2Item
+from raseed.enrichment.categorize import Outcome as Stage2Outcome
+from raseed.enrichment.categorize import categorize
+from raseed.enrichment.providers.base import CategorizationProvider
 from raseed.extraction.providers.base import (
     ExtractionProvider,
     ExtractionRequest,
@@ -157,12 +169,14 @@ class ReceiptFlow:
         pending: PendingStore,
         config: FlowConfig,
         clock: Callable[[], dt.datetime],
+        categorizer: CategorizationProvider | None = None,
     ) -> None:
         self._provider = provider
         self._images = images
         self._pending = pending
         self._config = config
         self._clock = clock
+        self._categorizer = categorizer
 
     # -- submission ----------------------------------------------------------
 
@@ -259,13 +273,17 @@ class ReceiptFlow:
             pending=receipt,
         )
 
+    def _over_budget(self, session: Session, *, user_id: str, now: dt.datetime) -> bool:
+        """Whether the rolling 24 hour API budget is already spent. Brief 16.6."""
+        since = now - dt.timedelta(days=1)
+        spent = queries.spend_micros_since(session, user_id=user_id, since=since)
+        return spent >= self._config.daily_cost_limit_micros
+
     def _check_budget(
         self, session: Session, *, user_id: str, now: dt.datetime
     ) -> FlowResult | None:
         """Brief 16.6. Refuse before spending, not after."""
-        since = now - dt.timedelta(days=1)
-        spent = queries.spend_micros_since(session, user_id=user_id, since=since)
-        if spent < self._config.daily_cost_limit_micros:
+        if not self._over_budget(session, user_id=user_id, now=now):
             return None
         return FlowResult(
             step=Step.LIMIT_REACHED,
@@ -273,6 +291,44 @@ class ReceiptFlow:
                 "I have hit the daily reading budget, so I did not read that one. "
                 "It resets on a rolling 24 hour window."
             ),
+        )
+
+    def _categorize(
+        self, session: Session, *, receipt: PendingReceipt, now: dt.datetime
+    ) -> Stage2Outcome:
+        """Run Stage 2 over the confirmed receipt's line items.
+
+        On confirm rather than on submit, so a receipt the user discards costs
+        nothing to categorize.
+
+        The model fallback is dropped when the daily budget is already gone: the
+        lexicon still runs, unmatched items land in `uncategorized`, and they are
+        re-runnable later for free from `raw_extractions`. Being over budget must
+        never cost the user the receipt.
+        """
+        allowed = tuple(
+            session.scalars(
+                select(Category.slug).where(
+                    Category.user_id == receipt.user_id, Category.deleted_at.is_(None)
+                )
+            ).all()
+        )
+        if UNCATEGORIZED_SLUG not in allowed:
+            # Seeding has not run for this user. Nothing to categorize into, so
+            # Stage 2 is skipped entirely rather than half applied.
+            return Stage2Outcome(decisions=())
+
+        provider = self._categorizer
+        if provider is not None and self._over_budget(session, user_id=receipt.user_id, now=now):
+            provider = None
+
+        return categorize(
+            [
+                Stage2Item(raw_name=item.raw_name, quantity_text=item.quantity_text)
+                for item in receipt.extraction.line_items
+            ],
+            allowed=allowed,
+            provider=provider,
         )
 
     # -- the user's decision -------------------------------------------------
@@ -303,14 +359,25 @@ class ReceiptFlow:
         printed = parse_printed_date(
             receipt.extraction.order_datetime_local, fallback_tz=self._config.default_timezone
         )
+
+        stage2 = self._categorize(session, receipt=receipt, now=now)
+        if stage2.provider_result is not None:
+            ledger.record_categorization(
+                session,
+                user_id=receipt.user_id,
+                result=stage2.provider_result,
+                source=raw.source,
+                image_sha256=raw.image_sha256,
+            )
+
         transaction = ledger.record_transaction(
             session,
-            user_id=receipt.user_id,
             raw=raw,
             reconciliation=receipt.reconciliation,
             occurred_on_local=receipt.occurred_on_local,
             date_source=(DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP),
             merchant=merchant,
+            enrichment=stage2,
         )
 
         self._images.delete(receipt.image_path)

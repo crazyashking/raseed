@@ -81,7 +81,6 @@ def store(
     verdict = reconcile(extraction)
     return ledger.record_transaction(
         session,
-        user_id=user.id,
         raw=raw,
         reconciliation=verdict,
         occurred_on_local=on,

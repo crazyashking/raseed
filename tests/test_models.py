@@ -84,6 +84,7 @@ def test_no_table_was_forgotten() -> None:
         "transactions",
         "transaction_line_items",
         "transaction_adjustments",
+        "lexicon_misses",
     }
 
 

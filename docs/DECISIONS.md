@@ -1140,6 +1140,160 @@ loader validates every field with explicit isinstance checks before trusting it.
 That runtime validation is what actually protects the lexicon. A mypy override
 records the reasoning.
 
+### 2026-08-08: `category_confidence` is stored in basis points, not as a float
+
+Brief 18.5 asks for "float for fuzzy and LLM paths, null for exact". It does not
+get a float. `test_no_floating_point_columns_anywhere` walks **every column of
+every table**, not only the money ones, and carving an exception into that test
+so it can hold a similarity score is a worse trade than storing the number
+differently.
+
+The column is `category_confidence_bp`: an integer in basis points, 0 to 10000,
+with a CHECK constraint on the range. Four significant digits, which is more
+precision than rapidfuzz's scores meaningfully carry, and 7826 reads as plainly
+as 78.26. Null on the exact path, exactly as the brief says.
+
+### 2026-08-08: "Nobody decided" is a null source, not a fifth enum member
+
+Brief 18.5 names four sources: `lexicon_exact`, `lexicon_fuzzy`, `llm`,
+`manual`. Every one of them is something that **decided**. An item the lexicon
+did not know, with no model available or a model that failed, has not been
+decided by any of them.
+
+That state is `category_source IS NULL`, not a new enum value. It is also
+exactly the query the backfill tool wants: `WHERE category_source IS NULL OR
+category_confidence_bp < 8000` is the set of rows worth re-running after a
+lexicon change. Adding a `NO_MATCH` member would have made that query longer and
+the enum less honest.
+
+A below-threshold model answer is different again: source is `llm`, the weak
+confidence is stored, and the category is `uncategorized`. Brief 18.5 says below
+threshold goes to uncategorized rather than getting a guess; it does not say to
+forget that the model was asked.
+
+### 2026-08-08: Stage 2's API spend is recorded in `raw_extractions`
+
+Brief 16.6's daily cap is computed by summing `raw_extractions.cost_micros_usd`
+over a rolling 24 hours. Stage 2's model fallback is a billed API call. Recorded
+anywhere else, or nowhere, the cap silently under-counts the moment the fallback
+starts firing, and a cap that under-counts is not a cap.
+
+So Stage 2 calls are written to the same table, with a new `stage` column
+(`extraction` | `categorization`, defaulting to `extraction` so every existing
+row keeps meaning what it meant). Stage 1 rows are what a transaction derives
+from; Stage 2 rows are billing and provenance only, and nothing has a foreign
+key to one.
+
+The alternative considered and rejected was a separate `api_calls` table. It
+would have needed the cap query to sum two tables and stay in sync forever, for
+no gain over one nullable-free enum column.
+
+### 2026-08-08: Stage 2 runs on confirm, and can never cost the user a receipt
+
+Three consequences, all deliberate:
+
+- **On confirm, not on submit.** A receipt the user discards costs nothing to
+  categorize.
+- **A fallback failure is not an error.** The lexicon's answers already stand and
+  the unmatched items are already `uncategorized`, so a rate-limited or broken
+  Stage 2 produces a receipt that stores fine with some items uncategorized. It
+  never produces a lost receipt. Brief 16.5 in spirit.
+- **Over budget drops the model, not the receipt.** If the daily cap is gone by
+  confirm time, the lexicon still runs and the fallback is skipped. Those rows
+  are re-runnable later from `raw_extractions` for free.
+
+### 2026-08-08: `tools/enrich.py` updates derived columns, and that reads on invariant 2
+
+Invariant 2 says the ledger is append-only and corrections are new rows. The
+backfill writes `category_id`, `category_source`, `category_confidence_bp` and
+`normalized_slug` in place on existing line items.
+
+The reading this rests on: those four columns are a **cache over
+`raw_extractions`**, not facts. `raw_name`, `line_total_minor`, `mrp_minor` and
+everything in `raw_extractions` are the facts, and none of them is ever touched.
+The schema already anticipated this in commit 4 ("the normalized columns are
+filled by Stage 2 and are null until then"), and brief 3.8 and 18.5 both
+describe re-running Stage 2 over history as the payoff for keeping Stage 1
+immutable, which is not possible if the derived columns can only be appended.
+
+**Flagged for Ashrit rather than assumed.** The tool reports by default and
+writes only on `--apply`, so nothing changes without an explicit choice. If the
+correct reading is that a re-categorization must be a new row, that is a
+schema change and a conversation, not an edit.
+
+### 2026-08-08: A colour word loses a tie to the product beside it
+
+`Orange Carrot` matched both `orange` and `carrot`. Both exact, both six
+letters, so the tie went to whichever came first and a carrot was filed as an
+orange. The category was right either way; `normalized_slug` was not, and that
+is the column that makes `Bhindi 500g` and `Okra 500g` the same product later.
+
+The blanket fix, "prefer the last matching token", breaks the case the matcher
+was built around: `Mr. Makhana Pudina Party Flavoured Makhana` would resolve to
+mint instead of fox nut. What actually distinguishes them is position relative
+to the noun. Colours precede it ("Green Cucumber", "Fresh White Eggs"), flavours
+follow it. So colours are demoted in a tie and nothing else changes. `Orange
+1kg` still matches the fruit, because there is nothing else in the name to
+prefer.
+
+### 2026-08-08: Stage 2 gets its own provider protocol, prompt directory and model
+
+Invariant 4 keeps extraction and categorization apart. One `Provider` interface
+with an `extract` and a `categorize` method would make it natural for a future
+implementation to answer both from a single call, which is the exact thing the
+invariant forbids. So `CategorizationProvider` is its own Protocol, the prompts
+live in `enrichment/prompts/` with their own versions (`categorize-v1`, prefixed
+so it cannot be confused with Stage 1's `v1` in the same column), and the model
+is a separate setting.
+
+The default Stage 2 model is `gemini-3.5-flash-lite`, $0.30 in and $2.50 out per
+million against Stage 1's $1.50 and $7.50. The binding constraint on that choice
+was not preference: `cost_micros` refuses to price a model with no published
+rate on file, and that refusal is what keeps the daily cap honest, so a newer
+lite variant means verifying its price first rather than guessing it in code.
+
+The taxonomy is baked into the wire schema as an enum, built per call because
+the categories live in the database and grow. The decoder therefore cannot emit
+a category that does not exist, so there is no "the model invented a category"
+failure mode downstream, only an "out of range index" one.
+
+### 2026-08-08: `normalized_slug` keeps the brand, `canonical_slug` is new
+
+Brief 16.7 defines `normalized_slug` with a worked example:
+`Amul Taaza Toned Milk 500ml` becomes `amul-taaza-toned-milk`. That is the
+printed name with the quantity stripped, and it keeps the brand.
+
+Stage 2 also produces a different answer: what the item **is**, from the
+lexicon. `Bhindi 500g` and `Okra 500g` share no `normalized_slug` at all, and
+brief 3.7's item canonicalization needs them to be one product.
+
+I had initially filled `normalized_slug` with the lexicon canonical, which
+silently redefined a column the brief specifies. Corrected: `normalized_slug`
+means what 16.7 says, and `canonical_slug` is a new column holding the lexicon's
+answer. Both are useful and neither can stand in for the other, so overloading
+one would have thrown the brand away permanently.
+
+### 2026-08-08: `quantity` is stored in `unit_normalized`, and packs stay separate
+
+Brief 16.7's example (`500ml` to `quantity 500, unit ml, unit_normalized ml`)
+does not disambiguate `1kg`. Storing `quantity 1` with `unit_normalized "g"`
+would mean one gram, and every price-per-unit comparison against it would be
+wrong by a factor of a thousand.
+
+So the quantity is expressed in the normalized unit: `1kg` is `1000` with `unit`
+"kg" and `unit_normalized` "g"; `1.5 L` is `1500` ml. Normalizing down to the
+small unit is also what keeps the column an integer, which invariant 1's
+reasoning covers as well as it covers money.
+
+`pack_count` is never multiplied into `quantity`. `2 x 500ml` is
+`pack_count 2, quantity 500`, exactly as the brief writes it, because a two-pack
+and a one-litre bottle are different products at different prices. Null pack
+count means the name said nothing, which is a different fact from "one".
+
+Blinkit prints the trailing form, `500 ml x 2`, in a separate quantity column
+rather than in the title. Both forms are parsed, and the receipt's own quantity
+column is preferred over a size buried in a product name.
+
 ---
 
 ## Still open

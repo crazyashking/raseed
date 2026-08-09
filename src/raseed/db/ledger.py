@@ -14,13 +14,17 @@ receipt is discarded. `record_transaction` is called only on confirm.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from raseed.db.models import (
     AdjustmentKind,
+    Category,
     DateSource,
+    ExtractionStage,
+    LexiconMiss,
     Merchant,
     RawExtraction,
     ReconciliationOutcome,
@@ -29,6 +33,9 @@ from raseed.db.models import (
     TransactionAdjustment,
     TransactionLineItem,
 )
+from raseed.enrichment.categorize import Decision
+from raseed.enrichment.categorize import Outcome as Stage2Outcome
+from raseed.enrichment.providers.base import CategorizationProviderResult
 from raseed.extraction.providers.base import ProviderResult
 from raseed.extraction.schemas import ExtractionResult
 from raseed.validation.reconcile import Outcome, Reconciliation
@@ -63,6 +70,42 @@ def record_extraction(
         user_id=user_id,
         image_sha256=image_sha256,
         source=source,
+        stage=ExtractionStage.EXTRACTION,
+        model_id=result.model_id,
+        prompt_version=result.prompt_version,
+        response_json=result.response_text,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cost_micros_usd=result.cost_micros_usd,
+    )
+    session.add(raw)
+    session.flush()
+    return raw
+
+
+def record_categorization(
+    session: Session,
+    *,
+    user_id: str,
+    result: CategorizationProviderResult,
+    source: Source,
+    image_sha256: str | None,
+) -> RawExtraction:
+    """Write what the Stage 2 fallback said, and what it cost.
+
+    Stored in `raw_extractions` alongside Stage 1 for one reason that outranks
+    tidiness: brief 16.6's daily cap sums `cost_micros_usd` over this table, and
+    a billed call recorded anywhere else is a call the cap cannot see. The
+    `stage` column keeps the two kinds of row apart.
+
+    Nothing has a foreign key to a row written here. It is billing and
+    provenance, not something a transaction derives from.
+    """
+    raw = RawExtraction(
+        user_id=user_id,
+        image_sha256=image_sha256,
+        source=source,
+        stage=ExtractionStage.CATEGORIZATION,
         model_id=result.model_id,
         prompt_version=result.prompt_version,
         response_json=result.response_text,
@@ -78,22 +121,32 @@ def record_extraction(
 def record_transaction(
     session: Session,
     *,
-    user_id: str,
     raw: RawExtraction,
     reconciliation: Reconciliation,
     occurred_on_local: dt.date,
     date_source: DateSource,
     merchant: Merchant | None = None,
     occurred_at_utc: dt.datetime | None = None,
+    enrichment: Stage2Outcome | None = None,
 ) -> Transaction:
     """Commit a confirmed receipt to the ledger.
 
     The extraction is re-read from `raw.response_json` rather than passed in
-    separately, so what is stored is provably what the model said.
+    separately, so what is stored is provably what the model said. The user is
+    taken from `raw` for the same reason: passing it alongside would allow a
+    caller to file one user's receipt under another.
+
+    `enrichment` is Stage 2's verdict, keyed by line-item position. It is
+    optional because Stage 2 is not allowed to be able to lose a receipt: a
+    categorizer that is missing, offline or out of budget produces nothing here
+    and the receipt still lands, with its items uncategorized and re-runnable
+    later from `raw_extractions` for free.
 
     Raises:
         NotStorableError: The gate returned Class 1. Nothing is written.
     """
+    user_id = raw.user_id
+    decisions = enrichment.decisions if enrichment else ()
     outcome = STORABLE_OUTCOMES.get(reconciliation.outcome)
     if outcome is None:
         msg = (
@@ -122,18 +175,34 @@ def record_transaction(
     session.add(transaction)
     session.flush()
 
+    by_position = {decision.position: decision for decision in decisions}
+    categories = _categories_by_slug(session, user_id=user_id)
+    line_rows: dict[int, TransactionLineItem] = {}
+
     for position, item in enumerate(extraction.line_items):
-        session.add(
-            TransactionLineItem(
-                user_id=user_id,
-                transaction_id=transaction.id,
-                position=position,
-                raw_name=item.raw_name,
-                quantity_text=item.quantity_text,
-                mrp_minor=item.mrp_minor,
-                line_total_minor=item.line_total_minor,
-            )
+        decision = by_position.get(position)
+        category = categories.get(decision.category_slug) if decision else None
+
+        line_row = TransactionLineItem(
+            user_id=user_id,
+            transaction_id=transaction.id,
+            position=position,
+            raw_name=item.raw_name,
+            quantity_text=item.quantity_text,
+            mrp_minor=item.mrp_minor,
+            line_total_minor=item.line_total_minor,
+            category_id=category.id if category else None,
+            category_source=decision.source if decision else None,
+            category_confidence_bp=decision.confidence_bp if decision else None,
+            canonical_slug=decision.canonical_slug if decision else None,
+            normalized_slug=decision.normalized.normalized_slug if decision else None,
+            quantity=decision.normalized.quantity if decision else None,
+            unit=decision.normalized.unit if decision else None,
+            unit_normalized=decision.normalized.unit_normalized if decision else None,
+            pack_count=decision.normalized.pack_count if decision else None,
         )
+        session.add(line_row)
+        line_rows[position] = line_row
 
     position = 0
     for kind, rows in (
@@ -155,7 +224,68 @@ def record_transaction(
             position += 1
 
     session.flush()
+
+    if enrichment is not None:
+        record_lexicon_misses(
+            session,
+            user_id=user_id,
+            decisions=decisions,
+            line_items=line_rows,
+            lexicon_name=enrichment.lexicon_name,
+            lexicon_version=enrichment.lexicon_version,
+        )
+
     return transaction
+
+
+def _categories_by_slug(session: Session, *, user_id: str) -> dict[str, Category]:
+    """This user's live categories, keyed by slug.
+
+    One query rather than one per line item, and it is a lookup rather than a
+    create: a Stage 2 answer is only ever allowed to name a category that
+    already exists, so a slug that has been deleted leaves the item with no
+    category rather than resurrecting it.
+    """
+    rows = session.scalars(
+        select(Category).where(Category.user_id == user_id, Category.deleted_at.is_(None))
+    ).all()
+    return {category.slug: category for category in rows}
+
+
+def record_lexicon_misses(
+    session: Session,
+    *,
+    user_id: str,
+    decisions: Sequence[Decision],
+    line_items: dict[int, TransactionLineItem],
+    lexicon_name: str,
+    lexicon_version: int,
+) -> list[LexiconMiss]:
+    """Log the words the lexicon did not know. Brief 4.5.
+
+    One row per occurrence, no counter, so the weekly review is a GROUP BY and
+    nothing written here ever needs an UPDATE. The lexicon version travels with
+    each row, which is what makes "did adding those twelve terms help" a query
+    rather than a feeling.
+    """
+    written: list[LexiconMiss] = []
+    for decision in decisions:
+        line_item = line_items.get(decision.position)
+        for term in decision.misses:
+            miss = LexiconMiss(
+                user_id=user_id,
+                term=term,
+                raw_name=decision.raw_name,
+                lexicon_name=lexicon_name,
+                lexicon_version=lexicon_version,
+                line_item_id=line_item.id if line_item else None,
+            )
+            session.add(miss)
+            written.append(miss)
+
+    if written:
+        session.flush()
+    return written
 
 
 def soft_delete_transaction(

@@ -6,6 +6,12 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+# A backup taken before a migration is still a database full of real receipts.
+# `*.db` does not cover `raseed.db.bak-<revision>`, and it was staged once.
+*.db.*
+*.bak
+*.sqlite
+*.sqlite3
 *.jpg
 *.jpeg
 *.png

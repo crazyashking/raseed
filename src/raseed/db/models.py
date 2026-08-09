@@ -102,6 +102,40 @@ class DateSource(enum.Enum):
     MESSAGE_TIMESTAMP = "message_timestamp"
 
 
+class ExtractionStage(enum.Enum):
+    """Which stage of the pipeline paid for a `raw_extractions` row.
+
+    Stage 2's model fallback is a billed API call like any other, and brief 16.6's
+    daily cap is computed by summing `cost_micros_usd` over this table. Recording
+    categorization calls anywhere else, or nowhere, would make that cap quietly
+    under-count the moment the fallback starts firing.
+
+    Stage 1 rows are what a transaction derives from. Stage 2 rows are billing
+    and provenance only: nothing has a foreign key to one.
+    """
+
+    EXTRACTION = "extraction"
+    CATEGORIZATION = "categorization"
+
+
+class CategorySource(enum.Enum):
+    """How a line item's category was decided. Brief 18.5.
+
+    Mirrors `raseed.enrichment.lexicon.Source` and is kept separate for the same
+    reason as `ReconciliationOutcome`: the stored values must not shift because
+    an in-memory enum got renamed. A test pins the two together.
+
+    This column is what makes a future lexicon improvement re-runnable against
+    only the weak rows. Without it, improving the lexicon means re-categorizing
+    a year of receipts or nothing.
+    """
+
+    LEXICON_EXACT = "lexicon_exact"
+    LEXICON_FUZZY = "lexicon_fuzzy"
+    LLM = "llm"
+    MANUAL = "manual"
+
+
 class ReconciliationOutcome(enum.Enum):
     """The gate's verdict, persisted alongside the row it let through.
 
@@ -226,6 +260,15 @@ class RawExtraction(Base):
     image_sha256: Mapped[str | None] = mapped_column(String(64))
 
     source: Mapped[Source] = mapped_column(Enum(Source, native_enum=False), nullable=False)
+
+    #: Which stage paid for this row. Defaults to extraction so every row written
+    #: before Stage 2 existed keeps meaning what it meant.
+    stage: Mapped[ExtractionStage] = mapped_column(
+        Enum(ExtractionStage, native_enum=False),
+        nullable=False,
+        default=ExtractionStage.EXTRACTION,
+        server_default=ExtractionStage.EXTRACTION.name,
+    )
 
     #: Exactly which model and prompt produced this, so a regression is
     #: attributable rather than mysterious.
@@ -369,6 +412,11 @@ class TransactionLineItem(Base):
         UniqueConstraint("transaction_id", "position", name="uq_line_items_txn_position"),
         Index("ix_line_items_user_category", "user_id", "category_id"),
         CheckConstraint("mrp_minor IS NULL OR mrp_minor >= 0", name="ck_line_items_mrp_positive"),
+        CheckConstraint(
+            "category_confidence_bp IS NULL OR "
+            "(category_confidence_bp >= 0 AND category_confidence_bp <= 10000)",
+            name="ck_line_items_confidence_range",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -386,12 +434,45 @@ class TransactionLineItem(Base):
 
     # --- Stage 2: derived from raw_name, null until enrichment runs. ---------
     #: Brief 16.7. Parsed deterministically with a regex table, not by a model.
+    #: The printed name with the quantity stripped and slugified:
+    #: `Amul Taaza Toned Milk 500ml` becomes `amul-taaza-toned-milk`.
     normalized_slug: Mapped[str | None] = mapped_column(String(200))
+
+    #: The lexicon's canonical name for what this actually is: `milk`, `okra`,
+    #: `mung_bean`. Distinct from `normalized_slug` on purpose. That one keeps
+    #: the brand and cannot tell you `Bhindi 500g` and `Okra 500g` are the same
+    #: vegetable; this one is exactly that answer, and it is what brief 3.7's
+    #: item canonicalization is built on. Null when the lexicon did not know it.
+    canonical_slug: Mapped[str | None] = mapped_column(String(120))
+
+    #: In `unit_normalized` units, integer. `1kg` is stored as 1000 with
+    #: `unit` "kg" and `unit_normalized` "g", so price-per-unit comparisons work
+    #: without a float anywhere. See `enrichment.normalize`.
     quantity: Mapped[int | None] = mapped_column(Integer)
     unit: Mapped[str | None] = mapped_column(String(16))
     unit_normalized: Mapped[str | None] = mapped_column(String(16))
+
+    #: `2 x 500ml` is pack_count 2 and quantity 500, never quantity 1000. A
+    #: two-pack and a one-litre bottle are different products at different
+    #: prices. Null means the name said nothing about packs.
     pack_count: Mapped[int | None] = mapped_column(Integer)
     category_id: Mapped[str | None] = mapped_column(ForeignKey("categories.id"))
+
+    #: Brief 18.5. Null means Stage 2 has not run on this row yet, which is a
+    #: different fact from "it ran and landed on uncategorized".
+    category_source: Mapped[CategorySource | None] = mapped_column(
+        Enum(CategorySource, native_enum=False)
+    )
+
+    #: Confidence in BASIS POINTS, integer, 0 to 10000. Brief 18.5 asks for a
+    #: float here. It does not get one: the no-floating-point test walks every
+    #: column of every table, not only the money ones, and carving an exception
+    #: into that test to hold a similarity score is a bad trade. Basis points
+    #: keep four significant digits, which is more than rapidfuzz's scores
+    #: meaningfully carry, and 7826 reads as plainly as 78.26.
+    #:
+    #: Null on the exact path, where there is nothing to be uncertain about.
+    category_confidence_bp: Mapped[int | None] = mapped_column(Integer)
 
     created_at: Mapped[dt.datetime] = _created_at()
     deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
@@ -435,6 +516,55 @@ class TransactionAdjustment(Base):
     transaction: Mapped[Transaction] = relationship(back_populates="adjustments")
 
 
+class LexiconMiss(Base):
+    """A product word the lexicon did not know. Brief 4.5.
+
+    The brief is blunt that its own "300 to 400 terms" estimate was invented and
+    should be deleted from thinking, and that the real answer comes out of this
+    table after a month of real receipts. So this is not diagnostics: it is the
+    mechanism by which the lexicon grows from actual spending.
+
+    One row per occurrence rather than a counter, so the weekly review is
+    ``GROUP BY term ORDER BY count(*) DESC`` and nothing here ever needs an
+    UPDATE. `lexicon_version` is stored so a miss recorded against version 1 is
+    distinguishable from one that survived version 2, which is what makes
+    "did adding those terms help" answerable instead of a feeling.
+
+    `deleted_at` is how a term gets dismissed: a brand name or a flavour word is
+    never going in the YAML, and soft-deleting it keeps it out of next week's
+    list without losing the fact that it was seen.
+    """
+
+    __tablename__ = "lexicon_misses"
+    __table_args__ = (
+        Index("ix_lexicon_misses_user_term", "user_id", "term"),
+        Index("ix_lexicon_misses_version", "lexicon_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    #: The unmatched token or n-gram, lowercased, exactly as `tokenize` produced
+    #: it. This is what gets pasted into the YAML if it turns out to be real.
+    term: Mapped[str] = mapped_column(String(200), nullable=False)
+
+    #: The whole printed product name the token came from. Without it a bare
+    #: `kaju` is ambiguous between the nut and a sweet, and the review is
+    #: guesswork again. Product text, not PII.
+    raw_name: Mapped[str] = mapped_column(String(400), nullable=False)
+
+    #: Which lexicon this missed against, and at what version.
+    lexicon_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    lexicon_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: Nullable because the backfill tool re-runs Stage 2 over stored extractions
+    #: whose line items may since have been soft deleted.
+    line_item_id: Mapped[str | None] = mapped_column(ForeignKey("transaction_line_items.id"))
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 #: Tables that may be soft deleted. `raw_extractions` is absent on purpose:
 #: it is immutable, so there is nothing to mark. Invariant 5.
 SOFT_DELETABLE_TABLES: Final[tuple[str, ...]] = (
@@ -444,6 +574,7 @@ SOFT_DELETABLE_TABLES: Final[tuple[str, ...]] = (
     "transactions",
     "transaction_line_items",
     "transaction_adjustments",
+    "lexicon_misses",
 )
 
 __all__ = [

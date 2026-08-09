@@ -25,6 +25,7 @@ from raseed.adapters.telegram import RaseedBot, build_application
 from raseed.config import PROJECT_ROOT, ConfigError, Settings
 from raseed.db.engine import create_engine
 from raseed.db.seed import bootstrap
+from raseed.enrichment.providers.gemini import GeminiCategorizer
 from raseed.extraction.providers.gemini import GeminiProvider
 from raseed.timezones import TimezoneDatabaseMissingError, zone
 from raseed.web import server as web
@@ -64,6 +65,9 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Sessi
     images = ImageStore(INCOMING)
     flow = ReceiptFlow(
         provider=GeminiProvider(api_key=settings.gemini_api_key, model_id=settings.gemini_model),
+        categorizer=GeminiCategorizer(
+            api_key=settings.gemini_api_key, model_id=settings.gemini_categorizer_model
+        ),
         images=images,
         pending=PendingStore(),
         config=FlowConfig(

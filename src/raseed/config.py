@@ -18,6 +18,7 @@ from typing import Final
 
 from dotenv import load_dotenv
 
+from raseed.enrichment.categorize import DEFAULT_CATEGORIZER_MODEL_ID
 from raseed.extraction.pricing import MICROS_PER_USD
 from raseed.validation.reconcile import DEFAULT_TOLERANCE_MINOR
 
@@ -112,6 +113,10 @@ class Settings:
     telegram_allowed_user_ids: frozenset[int]
     gemini_api_key: str = field(repr=False)
     gemini_model: str
+    #: Stage 2's model, which does not have to be Stage 1's. Categorizing short
+    #: strings is a cheaper job than reading a photograph, and pinning it
+    #: separately is what lets the expensive one move without dragging this along.
+    gemini_categorizer_model: str
     database_url: str
     default_currency: str
     default_timezone: str
@@ -132,6 +137,9 @@ class Settings:
             telegram_allowed_user_ids=_int_set("TELEGRAM_ALLOWED_USER_IDS"),
             gemini_api_key=_require("GEMINI_API_KEY"),
             gemini_model=_optional("GEMINI_MODEL", "gemini-3.6-flash"),
+            gemini_categorizer_model=_optional(
+                "GEMINI_CATEGORIZER_MODEL", DEFAULT_CATEGORIZER_MODEL_ID
+            ),
             database_url=_optional("DATABASE_URL", "sqlite:///raseed.db"),
             default_currency=_optional("DEFAULT_CURRENCY", "INR"),
             default_timezone=_optional("DEFAULT_TIMEZONE", "Asia/Kolkata"),

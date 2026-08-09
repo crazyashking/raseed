@@ -131,6 +131,22 @@ STOPWORDS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Colour words that are also real products. Kept out of a tie so a product is
+#: not named after its own adjective.
+#:
+#: Measured on the real line items: `Orange Carrot` matched both `orange` and
+#: `carrot`, both exact, both six letters, and the tie went to whichever came
+#: first, which filed a carrot as an orange. Colours precede the noun in these
+#: names ("Green Cucumber", "Fresh White Eggs") while flavours follow it
+#: ("Makhana Pudina"), so demoting the colour is right where a blanket
+#: prefer-the-last-token rule would break `Mr. Makhana Pudina Flavoured Makhana`.
+#:
+#: Only demoted, never dropped: `Orange 1kg` still matches the fruit, because
+#: there is nothing else in the name to prefer.
+COLOUR_WORDS: Final[frozenset[str]] = frozenset(
+    {"orange", "green", "white", "red", "black", "yellow", "brown"}
+)
+
 _SPLIT = re.compile(r"[^a-z0-9]+")
 
 
@@ -417,25 +433,40 @@ def match_tokens(
     return matches, misses
 
 
+def best_of(matches: list[Match]) -> Match | None:
+    """The most confident match in a set, or nothing.
+
+    A colour is set aside first, then exact beats fuzzy, then the higher score,
+    then the longer token: on `"Mr. Makhana Pudina Party Flavoured Makhana"`
+    both `makhana` and `pudina` hit, and `makhana` is the product while `pudina`
+    is the flavour.
+    """
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda m: (
+            m.token not in COLOUR_WORDS,
+            m.source is Source.LEXICON_EXACT,
+            m.score,
+            len(m.token),
+        ),
+    )
+
+
 def best_match(
     raw_name: str,
     *,
     lexicon: Lexicon | None = None,
     threshold: float = FUZZY_THRESHOLD,
 ) -> Match | None:
-    """The single most confident match in a product name, or nothing.
-
-    Exact beats fuzzy, and among equals the longer token wins: on
-    `"Mr. Makhana Pudina Party Flavoured Makhana"` both `makhana` and `pudina`
-    hit, and `makhana` is the product while `pudina` is the flavour.
-    """
+    """The single most confident match in a product name, or nothing."""
     matches, _ = match_tokens(raw_name, lexicon=lexicon, threshold=threshold)
-    if not matches:
-        return None
-    return max(matches, key=lambda m: (m.source is Source.LEXICON_EXACT, m.score, len(m.token)))
+    return best_of(matches)
 
 
 __all__ = [
+    "COLOUR_WORDS",
     "DEFAULT_LEXICON",
     "FUZZY_THRESHOLD",
     "LEXICON_DIR",
@@ -447,6 +478,7 @@ __all__ = [
     "Source",
     "Term",
     "best_match",
+    "best_of",
     "load",
     "match_tokens",
     "parse",
