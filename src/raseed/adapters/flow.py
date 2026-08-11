@@ -308,6 +308,7 @@ class ReceiptFlow:
             # the wrong thing to spend on one. That is not hypothetical: a DNS
             # failure inside the Gemini SDK arrives as an `httpx` error, which
             # is not an `APIError` and so was never translated at all.
+            #
             # Logged in full, including the cases the taxonomy does cover, and
             # tagged with a reference. That reference is the only thing tying
             # "it did not work" from a person to the line in this log that says
@@ -368,6 +369,15 @@ class ReceiptFlow:
             occurred_on_local=occurred_on_local,
             created_at=now,
             image_path=stored.path,
+            # Decided here, where `printed` is already known, and carried to
+            # confirm. It used to be left at its default and re-derived later,
+            # which meant `pending_receipts.date_source` said RECEIPT_PRINTED on
+            # every row including the guessed ones. Nothing read it, so nothing
+            # broke, and a stored column that is always the same wrong value is
+            # a trap for whoever reads it next. Brief 24.4.
+            date_source=(
+                DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP
+            ),
         )
         self._pending.put(session, receipt)
 
@@ -516,10 +526,6 @@ class ReceiptFlow:
                 merchant_tz=self._config.default_timezone,
             )
 
-        printed = parse_printed_date(
-            receipt.extraction.order_datetime_local, fallback_tz=self._config.default_timezone
-        )
-
         stage2 = self._categorize(session, receipt=receipt, now=now)
         if stage2.provider_result is not None:
             ledger.record_categorization(
@@ -536,9 +542,7 @@ class ReceiptFlow:
                 raw=raw,
                 reconciliation=receipt.reconciliation,
                 occurred_on_local=receipt.occurred_on_local,
-                date_source=(
-                    DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP
-                ),
+                date_source=receipt.date_source,
                 merchant=merchant,
                 enrichment=stage2,
             )
@@ -668,6 +672,8 @@ __all__ = [
     "FlowResult",
     "ReceiptFlow",
     "Step",
+    "already_logged_message",
+    "extraction_failed_message",
     "parse_printed_date",
     "rupees",
     "summarise",

@@ -1695,6 +1695,23 @@ reference, and the person gets the cause plus that reference. The reference is
 the image digest: already computed, stable, and revealing nothing once the image
 itself is deleted.
 
+**Second pass, and it found a stored column that was always wrong.**
+`PendingReceipt.date_source` was never assigned in `submit_image`, so it held
+its `RECEIPT_PRINTED` default on every row, including the ones where the date
+had been guessed from the Telegram message. It was written to
+`pending_receipts.date_source`, read back on rebuild, and consulted by nothing:
+`confirm` re-derived the answer by parsing the extraction a second time, so the
+ledger came out correct and the wrong value never surfaced. Both live pending
+rows held the default, which is what confirmed it.
+
+Its own docstring said it existed "so a rebuilt receipt still knows whether the
+date was printed or guessed", which was false. A stored column that is always
+the same wrong value is a trap for whoever reads it next, and brief 24.4's date
+editing is unbuilt, so the next person to build it would have reached for
+exactly this field. It is now set where `printed` is already known, `confirm`
+reads it instead of re-parsing, and a test carries a guessed date across a real
+database round trip.
+
 Also fixed, and too small to have argued about: `average_minor` came from
 `round(total / len(current))`. That reaches the correct answer for every amount
 this ledger will ever hold, and it reaches it through a float, while invariant 1

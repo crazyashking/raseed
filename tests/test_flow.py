@@ -1232,10 +1232,63 @@ def test_a_receipt_with_no_printed_date_falls_back_to_the_message(
     assert pending is not None
     assert pending.extraction.order_datetime_local is None
 
+    # The pending receipt records the guess at the moment it is made. It used to
+    # be left at its RECEIPT_PRINTED default and re-derived at confirm, so the
+    # ledger came out right while `pending_receipts.date_source` said the date
+    # was printed on every row it ever held.
+    assert pending.date_source is DateSource.MESSAGE_TIMESTAMP
+
     result = flow.confirm(session, pending.key)
     session.commit()
     assert result.transaction is not None
     assert result.transaction.date_source is DateSource.MESSAGE_TIMESTAMP
+
+
+def test_a_guessed_date_survives_the_pending_store(
+    file_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """The guess has to outlive a restart, because confirm no longer re-derives it.
+
+    `confirm` reads `receipt.date_source` instead of parsing the extraction a
+    second time, so a store that dropped the field on the way to disk would file
+    every guessed date as printed. Only a real round trip can show that.
+    """
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=DatabasePendingStore(secret=PENDING_SECRET),
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+
+    with file_sessions() as session:
+        user_id = bootstrap(session).id
+        session.commit()
+
+    with file_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        assert result.pending is not None
+        assert result.pending.date_source is DateSource.MESSAGE_TIMESTAMP
+        session.commit()
+
+    with file_sessions() as session:
+        rebuilt = flow.pending_for(session, result.pending.key)
+        assert rebuilt is not None
+        assert rebuilt.date_source is DateSource.MESSAGE_TIMESTAMP
+        assert flow.confirm(session, result.pending.key).transaction is not None
+        session.commit()
+
+    with file_sessions() as session:
+        stored_row = session.scalars(select(Transaction)).one()
+        assert stored_row.date_source is DateSource.MESSAGE_TIMESTAMP
 
 
 # ---------------------------------------------------------------------------
