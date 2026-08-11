@@ -46,7 +46,7 @@ from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ProviderResult
 from raseed.extraction.schemas import ExtractionResult
 from raseed.identity import user_id_for
-from raseed.money import apportion, money, rupees
+from raseed.money import apportion, compact, money, rupees
 from raseed.validation.reconcile import reconcile
 from raseed.web import data, render
 from raseed.web.server import Dashboard, handler_for
@@ -176,6 +176,97 @@ def test_apportion_is_deterministic_across_calls() -> None:
     """A reload must not move a paisa between two categories tied on remainder."""
     once = apportion(100, [1, 1, 1])
     assert all(apportion(100, [1, 1, 1]) == once for _ in range(5))
+
+
+@pytest.mark.parametrize(
+    ("minor", "currency", "text"),
+    [
+        # ISO 4217 gives the yen no subdivision, so two decimals would be invented.
+        (120000, "JPY", "JPY 120,000"),
+        # And the dinar three, so two would lose a real digit.
+        (1234567, "KWD", "KWD 1,234.567"),
+        (98748, "INR", "₹987.48"),
+    ],
+)
+def test_money_follows_the_currencys_own_decimal_places(
+    minor: int, currency: str, text: str
+) -> None:
+    assert money(minor, currency) == text
+
+
+@pytest.mark.parametrize(
+    ("minor", "currency", "text"),
+    [
+        # A lakh is a lakh. Calling it 0.1 million is a translation nobody asked for.
+        (25_000_000, "INR", "2.5L"),
+        (1_500_000_000, "INR", "1.5Cr"),
+        (25_000_000, "USD", "250k"),
+        (1_500_000_000, "USD", "15M"),
+        (-25_000_000, "INR", "-2.5L"),
+        (99_900, "INR", "999"),
+    ],
+)
+def test_compact_scales_the_way_the_currency_is_spoken(
+    minor: int, currency: str, text: str
+) -> None:
+    assert compact(minor, currency) == text
+
+
+def test_two_currencies_are_never_added_together(seeded: tuple[Session, User]) -> None:
+    """D13. Summing `amount_minor` across currencies adds paise to cents.
+
+    The result is denominated in nothing, and it is the number that used to
+    appear at the top of the page.
+    """
+    session, user = seeded
+    store(session, user, on=TODAY)  # INR 219.00
+    store(session, user, on=TODAY, currency="USD", grand_total_minor=1230)
+
+    assert data.currencies(session, user_id=user.id) == ["INR", "USD"]
+
+    rupees_view = data.overview(session, user_id=user.id, today=TODAY, currency="INR")
+    dollars_view = data.overview(session, user_id=user.id, today=TODAY, currency="USD")
+
+    assert (rupees_view.total_minor, rupees_view.receipt_count) == (21900, 1)
+    assert (dollars_view.total_minor, dollars_view.receipt_count) == (1230, 1)
+    assert rupees_view.currency == "INR"
+    assert dollars_view.currency == "USD"
+
+
+def test_the_bigger_spender_leads_the_page(seeded: tuple[Session, User]) -> None:
+    """So the currency someone lives in comes first and the holiday follows it."""
+    session, user = seeded
+    store(session, user, on=TODAY, currency="USD", grand_total_minor=500_00)
+    store(session, user, on=TODAY, grand_total_minor=100_00)
+    assert data.currencies(session, user_id=user.id) == ["USD", "INR"]
+
+
+def test_a_second_currency_gets_its_own_section(seeded: tuple[Session, User]) -> None:
+    """Rendered, never converted."""
+    session, user = seeded
+    store(session, user, on=TODAY)
+    store(session, user, on=TODAY, currency="USD", grand_total_minor=1230)
+
+    def view(currency: str) -> data.CurrencyView:
+        return data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=TODAY, currency=currency),
+            buckets=data.monthly_totals(
+                session, user_id=user.id, months=6, today=TODAY, currency=currency
+            ),
+            slices=[],
+        )
+
+    html = render.dashboard(
+        view=view("INR"),
+        rows=data.recent(session, user_id=user.id),
+        generated_at=NOW,
+        extra_views=[view("USD")],
+    )
+    assert "Also spent in USD" in html
+    assert "$12.30" in html
+    assert "₹219.00" in html
+    # 21900 paise + 1230 cents = 23130 of nothing. It must appear nowhere.
+    assert "231.30" not in html
 
 
 # ---------------------------------------------------------------------------
@@ -490,9 +581,11 @@ def test_a_balanced_row_is_not_flagged(seeded: tuple[Session, User]) -> None:
 def render_index(session: Session, user: User, *, today: dt.date = TODAY) -> str:
     start, end = data.month_bounds(today)
     return render.dashboard(
-        overview=data.overview(session, user_id=user.id, today=today),
-        buckets=data.monthly_totals(session, user_id=user.id, months=6, today=today),
-        slices=data.category_totals(session, user_id=user.id, start=start, end=end),
+        view=data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=today),
+            buckets=data.monthly_totals(session, user_id=user.id, months=6, today=today),
+            slices=data.category_totals(session, user_id=user.id, start=start, end=end),
+        ),
         rows=data.recent(session, user_id=user.id),
         generated_at=NOW,
     )
@@ -664,9 +757,11 @@ def test_a_long_category_list_folds_into_other() -> None:
         for index in range(12)
     ]
     html = render.dashboard(
-        overview=_overview(),
-        buckets=[data.Bucket("Aug", 100_00, 1)],
-        slices=slices,
+        view=data.CurrencyView(
+            overview=_overview(),
+            buckets=[data.Bucket("Aug", 100_00, 1)],
+            slices=slices,
+        ),
         rows=[],
         generated_at=NOW,
     )
@@ -685,9 +780,11 @@ def test_a_month_with_no_spend_is_drawn_as_empty_not_as_small() -> None:
         data.Bucket("Aug", 500_00, 3),
     ]
     html = render.dashboard(
-        overview=_overview(),
-        buckets=buckets,
-        slices=[],
+        view=data.CurrencyView(
+            overview=_overview(),
+            buckets=buckets,
+            slices=[],
+        ),
         rows=[],
         generated_at=NOW,
     )
@@ -721,9 +818,11 @@ def test_every_page_offers_the_boot_script_something_to_swap() -> None:
     """
     pages = {
         "dashboard": render.dashboard(
-            overview=_overview(),
-            buckets=[data.Bucket("Aug", 100_00, 1)],
-            slices=[],
+            view=data.CurrencyView(
+                overview=_overview(),
+                buckets=[data.Bucket("Aug", 100_00, 1)],
+                slices=[],
+            ),
             rows=[],
             generated_at=NOW,
             tabs=[data.Tab(slug=None, name="All", total_minor=100_00)],

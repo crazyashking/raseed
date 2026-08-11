@@ -37,7 +37,7 @@ import datetime as dt
 from html import escape
 
 from raseed.db.models import AdjustmentKind, DateSource
-from raseed.money import money
+from raseed.money import compact, money
 from raseed.web import data
 
 #: Height of the plot area in pixels, excluding value labels and month ticks.
@@ -292,20 +292,6 @@ def page(title: str, body: str) -> str:
     )
 
 
-def _compact(minor: int) -> str:
-    """A chart-tick amount: short enough for six of them on a phone.
-
-    Indian grouping, because that is what the ledger is in: a lakh is a lakh,
-    not 0.1 million.
-    """
-    rupees = minor / 100
-    if rupees >= 100_000:
-        return f"{rupees / 100_000:.1f}L".replace(".0L", "L")
-    if rupees >= 1_000:
-        return f"{rupees / 1_000:.1f}k".replace(".0k", "k")
-    return f"{rupees:,.0f}"
-
-
 def _brand(period: str) -> str:
     return (
         '<div class="top"><div class="brand"><span class="dot"></span>Raseed</div>'
@@ -354,7 +340,7 @@ def _delta(overview: data.Overview) -> str:
     return (
         f'<div class="delta"><span class="{css}"><span class="arrow">{arrow}</span> '
         f"{abs(pct):.0f}% {word}</span> than last month "
-        f"({escape(money(overview.previous_total_minor))})</div>"
+        f"({escape(money(overview.previous_total_minor, overview.currency))})</div>"
     )
 
 
@@ -368,7 +354,7 @@ def _hero(overview: data.Overview, *, scope: str | None = None) -> str:
     """
     stats = [
         ("Receipts", str(overview.receipt_count), ""),
-        ("Average", escape(money(overview.average_minor)), ""),
+        ("Average", escape(money(overview.average_minor, overview.currency)), ""),
     ]
     if overview.flagged_count:
         stats.append(("Needs a look", str(overview.flagged_count), " flag"))
@@ -392,7 +378,7 @@ def _hero(overview: data.Overview, *, scope: str | None = None) -> str:
     return (
         f'<div class="card">'
         f'<div class="eyebrow">{eyebrow}</div>'
-        f'<div class="total">{escape(money(overview.total_minor))}</div>'
+        f'<div class="total">{escape(money(overview.total_minor, overview.currency))}</div>'
         f"{_delta(overview)}"
         f'<div class="stats">{tiles}</div>{note}'
         f"</div>"
@@ -414,7 +400,7 @@ def _items(slices: list[data.Slice], what: str) -> str:
     bars = "".join(
         f'<div class="cat"><div class="cathead">'
         f'<span class="catname">{escape(item.name)}</span>'
-        f'<span class="catval"><b>{escape(money(item.total_minor))}</b>'
+        f'<span class="catval"><b>{escape(money(item.total_minor, item.currency))}</b>'
         f"<em>{item.share * 100:.0f}%</em></span></div>"
         f'<div class="track"><i style="width:{max(item.share * 100, 1.5):.1f}%;'
         f'--i:{index}"></i></div>'
@@ -443,6 +429,9 @@ def _chart(buckets: list[data.Bucket]) -> str:
 
     peak = max(b.total_minor for b in buckets)
     last = len(buckets) - 1
+    # Every bucket in one chart shares a currency: `monthly_totals` is called
+    # once per currency and the page draws one chart for each.
+    currency = buckets[0].currency
 
     columns, ticks = [], []
     for index, bucket in enumerate(buckets):
@@ -450,9 +439,9 @@ def _chart(buckets: list[data.Bucket]) -> str:
         if bucket.total_minor:
             height = max(3, round(bucket.total_minor / peak * (CHART_HEIGHT - 22)))
             bar = f'<div class="bar" style="height:{height}px;--i:{index}"></div>'
-            label = _compact(bucket.total_minor)
+            label = compact(bucket.total_minor, bucket.currency)
             receipts = f"{bucket.count} receipt{'s' if bucket.count != 1 else ''}"
-            tip = f"{bucket.label}: {money(bucket.total_minor)}, {receipts}"
+            tip = f"{bucket.label}: {money(bucket.total_minor, bucket.currency)}, {receipts}"
         else:
             bar = f'<div class="bar nil" style="height:3px;--i:{index}"></div>'
             label = "&mdash;"
@@ -472,7 +461,8 @@ def _chart(buckets: list[data.Bucket]) -> str:
         f'<div class="card"><div class="plot">{rules}'
         f'<div class="cols">{"".join(columns)}</div></div>'
         f'<div class="xrow">{"".join(ticks)}</div>'
-        f'<div class="hint">Peak month {escape(money(peak))}. Hover a bar for the detail.</div>'
+        f'<div class="hint">Peak month {escape(money(peak, currency))}. '
+        f"Hover a bar for the detail.</div>"
         f"</div>"
     )
 
@@ -507,7 +497,7 @@ def _categories(slices: list[data.Slice]) -> str:
     bars = "".join(
         f'<div class="cat"><div class="cathead">'
         f'<span class="catname">{escape(item.name)}</span>'
-        f'<span class="catval"><b>{escape(money(item.total_minor))}</b>'
+        f'<span class="catval"><b>{escape(money(item.total_minor, item.currency))}</b>'
         f"<em>{item.share * 100:.0f}%</em></span></div>"
         f'<div class="track"><i style="width:{max(item.share * 100, 1.5):.1f}%;'
         f'--i:{index}"></i></div>'
@@ -530,7 +520,7 @@ def _categories(slices: list[data.Slice]) -> str:
 
 def _row(row: data.Row) -> str:
     flag = (
-        f'<span class="tag">gap {escape(money(row.unaccounted_adjustment_minor))}</span>'
+        f'<span class="tag">gap {escape(money(row.unaccounted_adjustment_minor, row.currency))}</span>'
         if row.flagged
         else ""
     )
@@ -556,22 +546,26 @@ def _row(row: data.Row) -> str:
 
 def dashboard(
     *,
-    overview: data.Overview,
-    buckets: list[data.Bucket],
-    slices: list[data.Slice],
+    view: data.CurrencyView,
     rows: list[data.Row],
     generated_at: dt.datetime,
     tabs: list[data.Tab] | None = None,
     active_tab: str | None = None,
     active_tab_name: str | None = None,
+    extra_views: list[data.CurrencyView] | None = None,
 ) -> str:
     """The whole dashboard, as one self-contained page.
 
-    With `active_tab` set, every figure below the nav is scoped to that category
-    and is a **line-item** figure, not a grand total. The page says so, because
-    a category total and a receipt total are different quantities and quietly
-    swapping one for the other is how a dashboard starts lying.
+    With `active_tab` set, every figure below the nav is scoped to that
+    category, carrying its apportioned share of delivery, tax and order-level
+    coupons so that the tabs add back up to the total. See `data.line_shares`.
+
+    `extra_views` holds one entry per additional currency this user has
+    receipts in, each rendered as its own hero, chart and breakdown. Nothing is
+    ever added across them: converting needs a rate and a date to read it on,
+    which a ledger built on exact integers has no business inventing.
     """
+    overview, buckets, slices = view.overview, view.buckets, view.slices
     filtered = active_tab is not None
     what = escape(active_tab_name or "this category")
 
@@ -599,6 +593,14 @@ def dashboard(
         breakdown = f"<h2>Where it went</h2>{_categories(slices)}"
         receipts_heading = "<h2>Receipts</h2>"
 
+    others = "".join(
+        f"<h2>Also spent in {escape(view.currency)}</h2>"
+        f"{_hero(view.overview, scope=what if filtered else None)}"
+        f"{_chart(view.buckets)}"
+        f"{_items(view.slices, what) if filtered else _categories(view.slices)}"
+        for view in (extra_views or [])
+    )
+
     # Split into persistent chrome and swappable content. The boot script keeps
     # the chrome element when the tab set is unchanged and only replaces
     # `#content`, which is what lets the active pill animate between tabs
@@ -611,6 +613,7 @@ def dashboard(
         "<h2>Last six months</h2>"
         f"{_chart(buckets)}"
         f"{breakdown}"
+        f"{others}"
         f"{receipts_heading}"
         f"{listing}"
         "<footer><span>Read only. Nothing here can change the ledger.</span>"
@@ -623,13 +626,14 @@ def dashboard(
 def _adjustments(receipt: data.Receipt) -> str:
     if not receipt.adjustments:
         return ""
+    currency = receipt.row.currency
     rows = []
     for adjustment in receipt.adjustments:
         sign = "-" if adjustment.kind is AdjustmentKind.DISCOUNT else ""
         rows.append(
             f"<tr><td>{escape(adjustment.label)}"
             f'<div class="sub">{escape(adjustment.kind.value.lower())}</div></td>'
-            f'<td class="num">{sign}{escape(money(adjustment.amount_minor))}</td></tr>'
+            f'<td class="num">{sign}{escape(money(adjustment.amount_minor, currency))}</td></tr>'
         )
     return f'<h2>Charges and discounts</h2><div class="card"><table>{"".join(rows)}</table></div>'
 
@@ -637,13 +641,16 @@ def _adjustments(receipt: data.Receipt) -> str:
 def receipt_page(receipt: data.Receipt, *, generated_at: dt.datetime) -> str:
     """One receipt, every line, with the arithmetic shown."""
     row = receipt.row
+    # One receipt is one currency: `transactions.currency` is a column, and the
+    # gate reconciles within a single receipt, never across two.
+    currency = row.currency
 
     lines = []
     for line in receipt.lines:
         saved = line.saved_minor
         mrp = (
-            f'<div class="sub">MRP {escape(money(line.mrp_minor or 0))}'
-            f"{f', saved {escape(money(saved))}' if saved and saved > 0 else ''}</div>"
+            f'<div class="sub">MRP {escape(money(line.mrp_minor or 0, currency))}'
+            f"{f', saved {escape(money(saved, currency))}' if saved and saved > 0 else ''}</div>"
             if line.mrp_minor is not None
             else ""
         )
@@ -652,7 +659,7 @@ def receipt_page(receipt: data.Receipt, *, generated_at: dt.datetime) -> str:
         )
         lines.append(
             f"<tr><td>{escape(line.raw_name)}{quantity}{mrp}</td>"
-            f'<td class="num">{escape(money(line.line_total_minor))}</td></tr>'
+            f'<td class="num">{escape(money(line.line_total_minor, currency))}</td></tr>'
         )
 
     charges = receipt.total_for(AdjustmentKind.CHARGE)
@@ -663,19 +670,19 @@ def receipt_page(receipt: data.Receipt, *, generated_at: dt.datetime) -> str:
 
     maths = (
         f"<tr><td>Line items</td>"
-        f'<td class="num">{escape(money(receipt.line_subtotal_minor))}</td></tr>'
-        f'<tr><td>Charges</td><td class="num">{escape(money(charges))}</td></tr>'
-        f'<tr><td>Taxes</td><td class="num">{escape(money(taxes))}</td></tr>'
-        f'<tr><td>Discounts</td><td class="num">-{escape(money(discounts))}</td></tr>'
+        f'<td class="num">{escape(money(receipt.line_subtotal_minor, currency))}</td></tr>'
+        f'<tr><td>Charges</td><td class="num">{escape(money(charges, currency))}</td></tr>'
+        f'<tr><td>Taxes</td><td class="num">{escape(money(taxes, currency))}</td></tr>'
+        f'<tr><td>Discounts</td><td class="num">-{escape(money(discounts, currency))}</td></tr>'
         f'<tr class="sum"><td>Printed total</td>'
-        f'<td class="num">{escape(money(row.grand_total_minor))}</td></tr>'
+        f'<td class="num">{escape(money(row.grand_total_minor, currency))}</td></tr>'
     )
 
     gap = ""
     if delta:
         gap = (
             f'<div class="note">The arithmetic is off by '
-            f"<b>{escape(money(abs(delta)))}</b>, logged as an unaccounted adjustment. "
+            f"<b>{escape(money(abs(delta), currency))}</b>, logged as an unaccounted adjustment. "
             f"Either something was not printed, or a discount already inside the line "
             f"prices was subtracted twice.</div>"
         )

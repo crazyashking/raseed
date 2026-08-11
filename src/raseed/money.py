@@ -17,6 +17,28 @@ from typing import Final
 #: an unfamiliar receipt reads "USD 12.30" rather than silently printing rupees.
 SYMBOLS: Final[dict[str, str]] = {"INR": "₹", "USD": "$", "EUR": "€", "GBP": "£"}
 
+#: Minor units per major unit, as the exponent, for the currencies that are not
+#: the assumed two. ISO 4217 lists these explicitly. A yen has no subdivision at
+#: all, so printing "¥1,200.00" invents two digits the currency does not have,
+#: and a dinar has three, so printing two loses a real one.
+EXPONENTS: Final[dict[str, int]] = {
+    "BHD": 3,
+    "CLP": 0,
+    "ISK": 0,
+    "JOD": 3,
+    "JPY": 0,
+    "KRW": 0,
+    "KWD": 3,
+    "OMR": 3,
+    "TND": 3,
+    "VND": 0,
+}
+
+
+def exponent(currency: str) -> int:
+    """How many decimal places `currency` prints. Two unless ISO 4217 says otherwise."""
+    return EXPONENTS.get(currency.upper(), 2)
+
 
 def rupees(minor: int) -> str:
     """Format integer paise for a human. Never builds a float."""
@@ -94,8 +116,46 @@ def money(minor: int, currency: str = "INR") -> str:
     symbol = SYMBOLS.get(currency.upper())
     prefix = symbol if symbol else f"{currency.upper()} "
     sign = "-" if minor < 0 else ""
-    whole, fraction = divmod(abs(minor), 100)
-    return f"{sign}{prefix}{whole:,}.{fraction:02d}"
+    places = exponent(currency)
+    whole, fraction = divmod(abs(minor), 10**places)
+    if places == 0:
+        return f"{sign}{prefix}{whole:,}"
+    return f"{sign}{prefix}{whole:,}.{fraction:0{places}d}"
 
 
-__all__ = ["SYMBOLS", "apportion", "average", "money", "rupees"]
+def compact(minor: int, currency: str = "INR") -> str:
+    """A chart-tick amount, short enough for six of them across a phone.
+
+    Scaled the way the currency is spoken. Rupees go by lakh and crore, because
+    a lakh is a lakh and calling it 0.1 million is a translation nobody asked
+    for. Everything else goes by thousand and million.
+
+    Integer arithmetic throughout, including the single decimal place, because
+    invariant 1 does not stop applying at the point a number reaches a screen.
+    """
+    sign = "-" if minor < 0 else ""
+    major = abs(minor) // (10 ** exponent(currency))
+
+    if currency.upper() == "INR":
+        scales = ((10_000_000, "Cr"), (100_000, "L"), (1_000, "k"))
+    else:
+        scales = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k"))
+
+    for divisor, suffix in scales:
+        if major >= divisor:
+            whole, tenth = divmod((major * 10) // divisor, 10)
+            body = f"{whole}" if tenth == 0 else f"{whole}.{tenth}"
+            return f"{sign}{body}{suffix}"
+    return f"{sign}{major:,}"
+
+
+__all__ = [
+    "EXPONENTS",
+    "SYMBOLS",
+    "apportion",
+    "average",
+    "compact",
+    "exponent",
+    "money",
+    "rupees",
+]

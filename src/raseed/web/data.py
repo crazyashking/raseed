@@ -55,6 +55,8 @@ class Bucket:
     label: str
     total_minor: int
     count: int
+    #: Never summed across currencies. See `currencies`.
+    currency: str = "INR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +69,8 @@ class Slice:
     #: How many line items rolled into this. Only meaningful for item slices,
     #: where "bought 4 times" is the interesting part.
     count: int = 0
+    #: Never summed across currencies. See `currencies`.
+    currency: str = "INR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +84,8 @@ class Tab:
     slug: str | None
     name: str
     total_minor: int
+    #: Never summed across currencies. See `currencies`.
+    currency: str = "INR"
 
     @property
     def empty(self) -> bool:
@@ -136,6 +142,10 @@ class Overview:
     average_minor: int
     flagged_count: int
     api_spend_micros: int
+    #: What every figure above is denominated in. Never summed across
+    #: currencies: see `currencies` for why the page renders one of these per
+    #: currency instead of adding paise to cents.
+    currency: str = "INR"
 
     @property
     def delta_minor(self) -> int:
@@ -151,6 +161,24 @@ class Overview:
         if self.previous_total_minor == 0:
             return None
         return (self.delta_minor / self.previous_total_minor) * 100
+
+
+@dataclass(frozen=True, slots=True)
+class CurrencyView:
+    """One currency's worth of the page: the hero, its chart and its breakdown.
+
+    A user with receipts in one currency has exactly one of these and the page
+    looks as it always did. A user who came back from a trip has two, stacked,
+    with nothing added across them.
+    """
+
+    overview: Overview
+    buckets: list[Bucket]
+    slices: list[Slice]
+
+    @property
+    def currency(self) -> str:
+        return self.overview.currency
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,12 +309,11 @@ def line_shares(session: Session, *, user_id: str) -> dict[str, int]:
     is still counted on the All tab, which is the only figure that is always the
     whole truth.
     """
-    grand_totals: dict[str, int] = {
-        transaction_id: grand
-        for transaction_id, grand in session.execute(
-            select(Transaction.id, Transaction.grand_total_minor).where(_live(user_id))
-        )
-    }
+    grand_totals: dict[str, int] = {}
+    for transaction_id, grand in session.execute(
+        select(Transaction.id, Transaction.grand_total_minor).where(_live(user_id))
+    ):
+        grand_totals[transaction_id] = grand
 
     per_transaction: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for item_id, transaction_id, amount in session.execute(
@@ -329,17 +356,49 @@ def _category_subtotals(session: Session, *, user_id: str, slug: str) -> dict[st
     return dict(totals)
 
 
-def _rows(session: Session, *, user_id: str, category_slug: str | None = None) -> list[Row]:
+def currencies(session: Session, *, user_id: str) -> list[str]:
+    """Every currency this user has receipts in, biggest spender first.
+
+    A page renders one section per entry. Nothing is ever converted: a receipt
+    in dollars and a receipt in rupees are two facts, and adding them needs a
+    rate, a date to read that rate on, and a rounding rule, none of which a
+    ledger built on exact integers should invent. Deferred as Job B.
+
+    Ordered by spend so the currency someone actually lives in leads the page,
+    and the occasional holiday receipt follows it.
+    """
+    totals: dict[str, int] = defaultdict(int)
+    for currency, grand in session.execute(
+        select(Transaction.currency, Transaction.grand_total_minor).where(_live(user_id))
+    ):
+        totals[currency] += abs(grand)
+    return [c for c, _ in sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _rows(
+    session: Session,
+    *,
+    user_id: str,
+    category_slug: str | None = None,
+    currency: str | None = None,
+) -> list[Row]:
     """Every live transaction with its line count, newest first.
 
     With `category_slug`, only receipts that touched that category come back, and
     each carries what it contributed to it. See `Row.amount_minor` for why that
     is not the grand total.
+
+    With `currency`, only receipts in it. Every caller that totals these rows
+    passes one, because summing `amount_minor` across currencies adds paise to
+    cents and produces a number denominated in nothing.
     """
     transactions = list(
         session.scalars(
             select(Transaction)
-            .where(_live(user_id))
+            .where(
+                _live(user_id),
+                *((Transaction.currency == currency,) if currency is not None else ()),
+            )
             .order_by(Transaction.occurred_on_local.desc(), Transaction.created_at.desc())
         )
     )
@@ -388,6 +447,7 @@ def monthly_totals(
     months: int,
     today: dt.date,
     category_slug: str | None = None,
+    currency: str = "INR",
 ) -> list[Bucket]:
     """The last `months` calendar months, oldest first, gaps included as zero.
 
@@ -395,7 +455,7 @@ def monthly_totals(
     zero rather than being dropped, which would make the chart lie about time.
     """
     by_month: dict[str, tuple[int, int]] = {}
-    for row in _rows(session, user_id=user_id, category_slug=category_slug):
+    for row in _rows(session, user_id=user_id, category_slug=category_slug, currency=currency):
         key = month_key(row.occurred_on_local)
         total, count = by_month.get(key, (0, 0))
         by_month[key] = (total + row.amount_minor, count + 1)
@@ -404,12 +464,26 @@ def monthly_totals(
     cursor = today.replace(day=1)
     for _ in range(months):
         total, count = by_month.get(month_key(cursor), (0, 0))
-        buckets.append(Bucket(label=cursor.strftime("%b"), total_minor=total, count=count))
+        buckets.append(
+            Bucket(
+                label=cursor.strftime("%b"),
+                total_minor=total,
+                count=count,
+                currency=currency,
+            )
+        )
         cursor = previous_month(cursor).replace(day=1)
     return list(reversed(buckets))
 
 
-def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.date) -> list[Slice]:
+def category_totals(
+    session: Session,
+    *,
+    user_id: str,
+    start: dt.date,
+    end: dt.date,
+    currency: str = "INR",
+) -> list[Slice]:
     """Spend by category across a date range, inclusive on both ends.
 
     Categories live on line items, not on transactions, because one grocery
@@ -434,6 +508,7 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
             TransactionLineItem.deleted_at.is_(None),
             Transaction.occurred_on_local >= start,
             Transaction.occurred_on_local <= end,
+            Transaction.currency == currency,
         )
     )
     for category_id, item_id in rows:
@@ -442,19 +517,29 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
 
     grand = sum(totals.values())
     return [
-        Slice(name=name, total_minor=amount, share=(amount / grand) if grand else 0.0)
+        Slice(
+            name=name,
+            total_minor=amount,
+            share=(amount / grand) if grand else 0.0,
+            currency=currency,
+        )
         for name, amount in sorted(totals.items(), key=lambda kv: -kv[1])
     ]
 
 
 def overview(
-    session: Session, *, user_id: str, today: dt.date, category_slug: str | None = None
+    session: Session,
+    *,
+    user_id: str,
+    today: dt.date,
+    category_slug: str | None = None,
+    currency: str = "INR",
 ) -> Overview:
     """The headline figures for the month `today` falls in."""
     start, end = month_bounds(today)
     prev_start, prev_end = month_bounds(previous_month(today))
 
-    rows = _rows(session, user_id=user_id, category_slug=category_slug)
+    rows = _rows(session, user_id=user_id, category_slug=category_slug, currency=currency)
     current = [r for r in rows if start <= r.occurred_on_local <= end]
     previous = [r for r in rows if prev_start <= r.occurred_on_local <= prev_end]
 
@@ -467,6 +552,7 @@ def overview(
         average_minor=average(total, len(current)),
         flagged_count=sum(1 for r in rows if r.flagged),
         api_spend_micros=api_spend_micros(session, user_id=user_id),
+        currency=currency,
     )
 
 
@@ -486,12 +572,24 @@ def api_spend_micros(session: Session, *, user_id: str) -> int:
 
 
 def recent(
-    session: Session, *, user_id: str, limit: int = 25, category_slug: str | None = None
+    session: Session,
+    *,
+    user_id: str,
+    limit: int = 25,
+    category_slug: str | None = None,
+    currency: str | None = None,
 ) -> list[Row]:
-    return _rows(session, user_id=user_id, category_slug=category_slug)[:limit]
+    return _rows(session, user_id=user_id, category_slug=category_slug, currency=currency)[:limit]
 
 
-def tabs(session: Session, *, user_id: str, start: dt.date, end: dt.date) -> list[Tab]:
+def tabs(
+    session: Session,
+    *,
+    user_id: str,
+    start: dt.date,
+    end: dt.date,
+    currency: str = "INR",
+) -> list[Tab]:
     """The top nav. Brief section 2.
 
     Driven by the category table so a new domain needs no code change, in the
@@ -508,7 +606,9 @@ def tabs(session: Session, *, user_id: str, start: dt.date, end: dt.date) -> lis
     # duplicates the NULL-folding rule that Uncategorized depends on.
     totals = {
         slice_.name: slice_.total_minor
-        for slice_ in category_totals(session, user_id=user_id, start=start, end=end)
+        for slice_ in category_totals(
+            session, user_id=user_id, start=start, end=end, currency=currency
+        )
     }
 
     categories = list(
@@ -527,12 +627,13 @@ def tabs(session: Session, *, user_id: str, start: dt.date, end: dt.date) -> lis
     categories.sort(key=lambda c: (seed_order.get(c.slug, last), c.created_at, c.slug))
 
     return [
-        Tab(slug=None, name="All", total_minor=sum(totals.values())),
+        Tab(slug=None, name="All", total_minor=sum(totals.values()), currency=currency),
         *(
             Tab(
                 slug=category.slug,
                 name=category.display_name,
                 total_minor=totals.get(category.display_name, 0),
+                currency=currency,
             )
             for category in categories
         ),
@@ -547,6 +648,7 @@ def top_items(
     end: dt.date,
     category_slug: str,
     limit: int = 8,
+    currency: str = "INR",
 ) -> list[Slice]:
     """The biggest line items inside one category, for the drill-down.
 
@@ -575,6 +677,7 @@ def top_items(
             TransactionLineItem.deleted_at.is_(None),
             Transaction.occurred_on_local >= start,
             Transaction.occurred_on_local <= end,
+            Transaction.currency == currency,
             condition,
         )
     )
@@ -590,6 +693,7 @@ def top_items(
             total_minor=amount,
             share=(amount / grand) if grand else 0.0,
             count=counts[name],
+            currency=currency,
         )
         for name, amount in ranked
     ]
@@ -676,6 +780,7 @@ __all__ = [
     "UNCATEGORIZED",
     "AdjustmentDetail",
     "Bucket",
+    "CurrencyView",
     "LineDetail",
     "Overview",
     "Receipt",
@@ -684,6 +789,7 @@ __all__ = [
     "Tab",
     "api_spend_micros",
     "category_totals",
+    "currencies",
     "flagged",
     "line_shares",
     "month_bounds",

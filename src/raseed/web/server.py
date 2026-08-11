@@ -56,6 +56,11 @@ DEFAULT_PORT: Final[int] = 8770
 #: How many months the bar chart covers.
 CHART_MONTHS: Final[int] = 6
 
+#: What an empty dashboard is denominated in. Only reachable before a user's
+#: first receipt lands. After that the ledger's own currencies drive the page
+#: and this is never consulted, so it is a placeholder rather than a setting.
+EMPTY_LEDGER_CURRENCY: Final[str] = "INR"
+
 #: How many receipts the table lists. Enough to scroll, not enough to render a
 #: megabyte of HTML on a phone once the ledger has a few years in it.
 RECENT_LIMIT: Final[int] = 50
@@ -139,31 +144,60 @@ class Dashboard:
         today = now.date()
         with self._sessions() as session:
             start, end = data.month_bounds(today)
-            entries = data.tabs(session, user_id=user_id, start=start, end=end)
 
+            # Biggest spender first, so the currency someone lives in leads the
+            # page. An empty ledger has none, and falls back to the configured
+            # default so the page still renders its empty state in something.
+            present = data.currencies(session, user_id=user_id) or [EMPTY_LEDGER_CURRENCY]
+
+            entries = data.tabs(session, user_id=user_id, start=start, end=end, currency=present[0])
             active = next((e for e in entries if e.slug is not None and e.slug == tab), None)
             slug = active.slug if active else None
 
-            slices = (
-                data.top_items(session, user_id=user_id, start=start, end=end, category_slug=slug)
-                if slug is not None
-                else data.category_totals(session, user_id=user_id, start=start, end=end)
-            )
+            def view(currency: str) -> data.CurrencyView:
+                return data.CurrencyView(
+                    overview=data.overview(
+                        session,
+                        user_id=user_id,
+                        today=today,
+                        category_slug=slug,
+                        currency=currency,
+                    ),
+                    buckets=data.monthly_totals(
+                        session,
+                        user_id=user_id,
+                        months=CHART_MONTHS,
+                        today=today,
+                        category_slug=slug,
+                        currency=currency,
+                    ),
+                    slices=(
+                        data.top_items(
+                            session,
+                            user_id=user_id,
+                            start=start,
+                            end=end,
+                            category_slug=slug,
+                            currency=currency,
+                        )
+                        if slug is not None
+                        else data.category_totals(
+                            session, user_id=user_id, start=start, end=end, currency=currency
+                        )
+                    ),
+                )
+
+            views = [view(currency) for currency in present]
             return render.dashboard(
-                overview=data.overview(session, user_id=user_id, today=today, category_slug=slug),
-                buckets=data.monthly_totals(
-                    session,
-                    user_id=user_id,
-                    months=CHART_MONTHS,
-                    today=today,
-                    category_slug=slug,
-                ),
-                slices=slices,
+                view=views[0],
+                # Receipt rows carry their own currency and are formatted one by
+                # one, so the list stays in date order across all of them.
                 rows=data.recent(session, user_id=user_id, limit=RECENT_LIMIT, category_slug=slug),
                 generated_at=now,
                 tabs=entries,
                 active_tab=slug,
                 active_tab_name=active.name if active else None,
+                extra_views=views[1:],
             )
 
     def receipt(self, user_id: str, transaction_id: str) -> str | None:
@@ -318,6 +352,7 @@ __all__ = [
     "CHART_MONTHS",
     "CSP",
     "DEFAULT_PORT",
+    "EMPTY_LEDGER_CURRENCY",
     "HOST",
     "RECENT_LIMIT",
     "Dashboard",

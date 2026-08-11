@@ -101,11 +101,15 @@ def _from_database(out: pathlib.Path) -> int:
                 else data.category_totals(session, user_id=user_id, start=start, end=end)
             )
             page = render.dashboard(
-                overview=data.overview(session, user_id=user_id, today=today, category_slug=slug),
-                buckets=data.monthly_totals(
-                    session, user_id=user_id, months=6, today=today, category_slug=slug
+                view=data.CurrencyView(
+                    overview=data.overview(
+                        session, user_id=user_id, today=today, category_slug=slug
+                    ),
+                    buckets=data.monthly_totals(
+                        session, user_id=user_id, months=6, today=today, category_slug=slug
+                    ),
+                    slices=slices,
                 ),
-                slices=slices,
                 rows=data.recent(session, user_id=user_id, limit=50, category_slug=slug),
                 generated_at=now,
                 tabs=entries,
@@ -219,9 +223,11 @@ def _demo(out: pathlib.Path) -> int:
     _write(
         out / "index.html",
         render.dashboard(
-            overview=overview,
-            buckets=buckets,
-            slices=slices,
+            view=data.CurrencyView(
+                overview=overview,
+                buckets=buckets,
+                slices=slices,
+            ),
             rows=rows,
             generated_at=now,
             tabs=entries,
