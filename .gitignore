@@ -17,6 +17,12 @@ data/
 *.png
 *.pdf
 
+# Internal status board. Kept on disk, never published. It is a live project
+# management document: budgets, people, half-made decisions and who owes what.
+# Nothing in the codebase references it, unlike the brief (140 references) and
+# DECISIONS.md (31), which are the public record and stay tracked.
+docs/PLANNER.md
+
 # Secrets
 .env
 .env.*
