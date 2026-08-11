@@ -1651,11 +1651,16 @@ keys, no tokens, no home directory paths, no email addresses, and eval data that
 is synthetic groceries with nothing personal in it. Three things were not clean.
 
 **A live Telegram identifier was being used as documentation.** `identity.py`,
-`tools/claim.py` and this file all illustrated the derivation with
-`123456789`, the account ID of the running bot and the first half of its token.
-The secret half was never committed, so nothing needed rotating, and a public
-repo still should not name a running bot. Replaced with `123456789` and scrubbed
-from history before the first push, which is the only moment that costs nothing.
+`tools/claim.py` and this file all illustrated the derivation with the running
+bot's real account ID, which is also the first half of its token. The secret
+half was never committed, so nothing needed rotating, and a public repo still
+should not name a running bot. Replaced with an obviously fake `123456789`
+everywhere, then scrubbed from history before the first push, which is the only
+moment that costs nothing.
+
+Writing this entry put the real ID straight back into the file documenting its
+removal, and the scrub caught it only because the scrub ran afterwards. The
+write-up is part of the surface being swept.
 
 **D11 never existed.** Traced to the paragraph above this entry, tracked for
 three days as outstanding work, and twice repeated to Ashrit as a prerequisite
