@@ -8,12 +8,12 @@ optional category slug that is matched against the user's own category table.
 23.1 allowlist does not have one, and invariant 12 says an install is a
 conversation, not a convenience.
 
-**It still binds to 127.0.0.1 and nothing else**, and now that there is a public
-address that matters more, not less. Cloudflare Tunnel makes an outbound
-connection to this loopback socket and terminates TLS at Cloudflare's edge, so
-nothing has to listen on a public interface, no port is forwarded, and no
-firewall hole is opened. `HOST` is still not read from the environment: making
-this listen on 0.0.0.0 should require editing code and thinking about it.
+**It still binds to 127.0.0.1 and nothing else**, and with a public address in
+front of it that matters more. On the deployed host, nginx owns ports 80 and
+443, terminates TLS with a Let's Encrypt certificate, and proxies to this
+loopback socket, so the only process reachable from the internet is the one
+whose job that is. `HOST` is still not read from the environment: making this
+listen on 0.0.0.0 should require editing code and thinking about it.
 
 **Every page requires proof of who is asking.** The proof is Telegram's signed
 `initData`, sent in an `Authorization: tma <blob>` header and verified in

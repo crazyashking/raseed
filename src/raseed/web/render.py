@@ -909,7 +909,7 @@ _BOOT = """
       refused.answered = true;
       throw refused;
     }, function () {
-      var unreachable = new Error('Could not reach the dashboard. It runs on a home machine, so if that is asleep this page cannot load.');
+      var unreachable = new Error('Could not reach the dashboard. Check your connection and try again in a moment.');
       unreachable.answered = false;
       throw unreachable;
     });
@@ -985,8 +985,8 @@ def shell() -> str:
         '<div class="top"><div class="brand"><span class="dot"></span>Raseed</div></div>'
         '<div class="card"><div class="empty">'
         '<div class="big">Could not reach Raseed.</div>'
-        '<div class="small">The dashboard runs on a home machine. '
-        "If it is asleep this page cannot load. Try again in a moment.</div>"
+        '<div class="small">The dashboard did not answer. '
+        "Check your connection and try again in a moment.</div>"
         "</div></div></div>"
         "</div>"
         f"<script>{_BOOT}</script>"

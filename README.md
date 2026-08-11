@@ -7,7 +7,8 @@ Send the bot a picture of a bill. It reads the line items, reconciles the
 arithmetic against the printed total, asks you to confirm, and writes an
 append-only ledger row. Then it deletes the image.
 
-Status: early. See `docs/PLANNER.md` for what is built and what is next.
+Status: early. `docs/DECISIONS.md` records every architectural call and why it
+was made, including the ones that turned out wrong.
 
 ## How it works
 
@@ -33,7 +34,7 @@ confirm the row.
 ## Layout
 
 ```
-docs/            the brief, the planner, the decision log, proposals
+docs/            the brief, the decision log, proposals
 src/             the package
 alembic/         the migrations, which own the schema
 tests/           fixtures and the suite
@@ -81,6 +82,28 @@ The checks:
 Dependencies come from a fixed allowlist and are hash-pinned in
 `requirements.txt`. Adding one is a deliberate decision, recorded in
 `docs/DECISIONS.md`.
+
+## Deployment
+
+`requirements.txt` pins hashes for Windows wheels, so pip rejects it on Linux.
+`requirements-linux-aarch64.txt` is the runtime set for ARM Linux: the nine
+packages the application imports plus their dependencies, without the test and
+lint tooling.
+
+```
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-linux-aarch64.txt
+DATABASE_URL=... .venv/bin/python -m alembic upgrade head
+```
+
+`alembic/env.py` reads `DATABASE_URL` from the real environment and does not
+read `.env`, so pass it explicitly when running migrations by hand. Without it
+alembic silently falls back to a relative `raseed.db` and creates an empty one.
+
+The dashboard listens on `127.0.0.1:8770` and that is not configurable. In front
+of it, a reverse proxy terminates TLS and forwards to loopback; Telegram will
+not open a Mini App over plain HTTP, so `DASHBOARD_PUBLIC_URL` must be an
+`https://` address that resolves publicly.
 
 ## License
 

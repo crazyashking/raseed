@@ -375,9 +375,7 @@ class ReceiptFlow:
             # every row including the guessed ones. Nothing read it, so nothing
             # broke, and a stored column that is always the same wrong value is
             # a trap for whoever reads it next. Brief 24.4.
-            date_source=(
-                DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP
-            ),
+            date_source=(DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP),
         )
         self._pending.put(session, receipt)
 

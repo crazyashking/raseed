@@ -120,7 +120,7 @@ class RaseedBot:
         user_id_secret: Derives each person's `user_id` from their Telegram ID.
             See `raseed.identity`. Never stored, and must never change.
         dashboard_url: The loopback address, for when there is no public one.
-        public_url: The Cloudflare Tunnel address. Its presence is what turns
+        public_url: The public HTTPS address. Its presence is what turns
             `/dashboard` into a Mini App button, which is the only form that
             carries the signed `initData` the dashboard authenticates with.
     """

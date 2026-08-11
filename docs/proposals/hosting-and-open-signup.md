@@ -1,6 +1,11 @@
 # Proposal: 24/7 hosting, a backend database, and open signup
 
-Status: **draft, awaiting Ashrit's answers.** Nothing here is built.
+Status: **partly built as of 2026-08-11.** The hosting half is done and running:
+Oracle Always Free ARM, SQLite on the instance, dynamic DNS, nginx and certbot.
+The open-signup half is not built, and the allowlist is still in force. See the
+2026-08-11 entry in `docs/DECISIONS.md` for what was actually deployed, including
+where it departs from the recommendations below.
+
 Raised 2026-08-10, in response to: host it so the PC can be off, let friends use
 it, keep it free beyond the Gemini spend, and drop the allowlist so it can spread
 by word of mouth.
@@ -121,7 +126,7 @@ BotFather) disappears once the process stops restarting. It still needs a name.
 
 | Option | Cost | Notes |
 |---|---|---|
-| **DuckDNS + Caddy** (recommended) | free | Stable subdomain, Let's Encrypt certificate issued and renewed automatically. Opens 443 on the VM. |
+| **Dynamic DNS + Caddy** (recommended) | free | Stable subdomain, Let's Encrypt certificate issued and renewed automatically. Opens 443 on the VM. Built with nginx and certbot instead, because both ship in Ubuntu's archive and Caddy would have added a third-party repository. |
 | **Tailscale Funnel** | free | Stable `*.ts.net` name, valid certificate, no domain and no open port. Bandwidth is throttled and not configurable. |
 | **Cloudflare named tunnel** | ~$10/yr | Needs a domain in a Cloudflare zone. Not free. Rules itself out. |
 

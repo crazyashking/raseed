@@ -174,7 +174,7 @@ class Settings:
     #: point of it is that one user staying inside their own budget says nothing
     #: about the total.
     global_daily_cost_limit_micros: int
-    #: The public HTTPS address the Cloudflare Tunnel serves, or empty. Telegram
+    #: The public HTTPS address the dashboard is reachable at, or empty. Telegram
     #: will not open a Mini App over plain HTTP or at 127.0.0.1, so while this is
     #: empty the bot hands over a loopback link instead of a button.
     dashboard_public_url: str

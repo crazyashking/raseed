@@ -1,0 +1,76 @@
+# Runtime lock for linux/aarch64, CPython 3.12.
+#
+# Generated on the Oracle host, because the hashes in requirements.txt cover
+# Windows wheels and pip rejects them on this platform. Install with:
+#   .venv/bin/python -m pip install --require-hashes -r requirements-linux-aarch64.txt
+#
+# This is the runtime set only. Test and lint tooling is not installed on the server.
+
+alembic==1.19.1 \
+    --hash=sha256:b39018cb3d9413a19cbd54cf3c02ad33998641f0538eb77413a488a21c3e14be
+annotated-types==0.8.0 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+anyio==4.14.2 \
+    --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494
+certifi==2026.7.22 \
+    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
+cffi==2.1.1 \
+    --hash=sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890
+charset-normalizer==3.4.9 \
+    --hash=sha256:9b2aff1c7b3884512b9512c3eaadd9bab39fb45042ffaaa1dd08ff2b9f8109d9
+cryptography==50.0.0 \
+    --hash=sha256:07949c449a1abcf60d1ee6e88956d89404c7df3c8258f46589e912988e551987
+distro==1.9.0 \
+    --hash=sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2
+google-auth==2.56.3 \
+    --hash=sha256:8ec438808f813ad034535000261eed1067475d229d05bbf4216e78c3f2362e53
+google-genai==2.17.0 \
+    --hash=sha256:a4835563c60aee646c9c4b261c507aa4a624710d25017012d20dc65abf3d9a54
+greenlet==3.5.5 \
+    --hash=sha256:55272212cbc5f43d1d723725ab931f1939969b7e9523882ca58b55061769d053
+h11==0.16.0 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+httpcore==1.0.9 \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55
+httpx==0.28.1 \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+idna==3.18 \
+    --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
+mako==1.4.1 \
+    --hash=sha256:a359d9a94a541213958742b2698d0a7757bb83551767bc468a74b9905aba9617
+markupsafe==3.0.3 \
+    --hash=sha256:3a7e8ae81ae39e62a41ec302f972ba6ae23a5c5396c8e60113e9066ef893da0d
+pyasn1==0.6.4 \
+    --hash=sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b
+pyasn1-modules==0.4.2 \
+    --hash=sha256:29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+pydantic==2.13.4 \
+    --hash=sha256:45a282cde31d808236fd7ea9d919b128653c8b38b393d1c4ab335c62924d9aba
+pydantic-core==2.46.4 \
+    --hash=sha256:8233f2947cf85404441fd7e0085f53b10c93e0ee78611099b5c7237e36aacbf7
+python-dotenv==1.2.2 \
+    --hash=sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a
+python-telegram-bot==22.8 \
+    --hash=sha256:42373918097f1b837cc4e717d588c19ea79651497ec712bb5b0c76e5e63c50e1
+pyyaml==6.0.3 \
+    --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28
+rapidfuzz==3.14.5 \
+    --hash=sha256:01550fe5f60fd176aa66b7611289d46dc4aa4b1b904874c7b6d1d54e581c5ec1
+requests==2.34.2 \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+sniffio==1.3.1 \
+    --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2
+sqlalchemy==2.0.51 \
+    --hash=sha256:581921d849d6e6f994d560389192955e80e2950e18fcdfe2ccea863e01158e6e
+tenacity==9.1.4 \
+    --hash=sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+typing-inspection==0.4.3 \
+    --hash=sha256:5f42b23858a91e0b4ef521f5418f03a0da3c9216fd2995ef5e73463100e676cd
+urllib3==2.7.0 \
+    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+websockets==16.1.1 \
+    --hash=sha256:8087e82f842609734c9b5a1330464f8e94e346ba0e18c832c08bafa4b0d63c15

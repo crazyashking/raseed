@@ -123,9 +123,9 @@ def main() -> int:
     bot, images, sessions = build(settings)
 
     # Still bound to loopback, and more deliberately now that there is a public
-    # address: Cloudflare Tunnel dials out to this socket, so nothing listens on
-    # a public interface and no port is forwarded. Every page behind `/` requires
-    # a signed Telegram `initData`.
+    # address: nginx terminates TLS and proxies here, so this process is never
+    # reachable from the internet directly. Every page behind `/` requires a
+    # signed Telegram `initData`.
     web.serve(
         session_factory=sessions,
         clock=now_utc,

@@ -1719,6 +1719,61 @@ says money is integer minor units and the README says "no floats, anywhere". Now
 `money.average`, integer throughout, rounding half away from zero because
 refunds are their own negative rows per brief 16.8.
 
+### 2026-08-11: the bot moved off the home machine, and D3 closed to do it
+
+Running on a laptop meant the bot was up only while a terminal was, and the
+Cloudflare quick tunnel handed out a new hostname every restart. It now runs on
+an Oracle Always Free ARM instance in `us-phoenix-1`, AD-2: `VM.Standard.A1.Flex`
+at 1 OCPU and 6 GB, Ubuntu 24.04 aarch64. Always Free means no charge and no
+expiry, so the only running cost is still Gemini.
+
+**Oracle picks the shape, capacity picks the availability domain.** A1.Flex was
+out of capacity in AD-1 and available in AD-2. Nothing in the design depends on
+which one, and it is recorded here so the next person does not read the AD as a
+decision.
+
+**D3 is closed.** `requirements.txt` is hash-locked against Windows wheels, and
+pip rejects those hashes on aarch64, so `--require-hashes` could not be used on
+the server at all. `requirements-linux-aarch64.txt` is the runtime set for this
+platform, generated on the host itself, and it installs into a clean virtualenv
+with every hash verified. It carries 34 packages against the 71 in the Windows
+file because the server runs the nine packages the application imports and none
+of the test or lint tooling. Two transitive versions resolved newer than the
+Windows lock: `greenlet` 3.5.5 and `typing_inspection` 0.4.3. `pip-audit`
+reports no known vulnerabilities against it.
+
+**Nothing binds to a public interface except nginx.** The dashboard still
+listens on `127.0.0.1:8770` and `HOST` is still not configurable. nginx owns 80
+and 443, terminates TLS with a Let's Encrypt certificate, and proxies to
+loopback. The hostname is a free dynamic-DNS subdomain, kept current by a
+systemd timer because an Oracle ephemeral public IP is released when the
+instance stops. This replaces Cloudflare Tunnel,
+which was doing the same job from the other direction, and five comments across
+`server.py`, `config.py`, `telegram.py` and `__main__.py` that described the
+tunnel have been rewritten to describe what is actually there. The dashboard's
+own offline card said "the dashboard runs on a home machine", which is now
+false, so it says something true instead.
+
+**The trust boundary is Canonical plus PyPI plus Let's Encrypt.** Caddy would
+have been less configuration and one more party to trust, since it is not in
+Ubuntu's archive. nginx and certbot both are, so the only signing key involved
+is the one already on the image.
+
+**The service runs as a system account that can write exactly two paths.**
+`raseed` has no login shell. The unit sets `ProtectSystem=strict` with
+`ReadWritePaths` limited to `/var/lib/raseed` and `/opt/raseed/data`, so the
+ledger and the short-lived receipt images are writable and the rest of the
+filesystem is not. `.env` is `0600` in `/var/lib/raseed` with a symlink from the
+repo root, which keeps secrets outside the git checkout entirely.
+
+`USER_ID_SECRET` was carried across byte for byte and verified by comparing
+digests rather than values. Changing it would rederive every `user_id` and
+orphan the existing ledger, which is why `identity.py` says it must never change.
+
+**Removed from the image: `rpcbind` and `nfs-common`.** The Ubuntu image ships
+them listening on port 111. Nothing here uses NFS, and a firewall rule is a
+worse answer than not running the service.
+
 ---
 
 ## Still open
