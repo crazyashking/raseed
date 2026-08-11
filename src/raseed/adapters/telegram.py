@@ -36,7 +36,13 @@ from telegram.ext import (
     filters,
 )
 
-from raseed.adapters.flow import FlowResult, ReceiptFlow, Step, rupees
+from raseed.adapters.flow import (
+    UNREADABLE_FILE_MESSAGE,
+    FlowResult,
+    ReceiptFlow,
+    Step,
+    rupees,
+)
 from raseed.adapters.pending import PendingKey, PendingReceipt
 from raseed.db import ledger, queries
 from raseed.db.models import User
@@ -191,7 +197,15 @@ class RaseedBot:
         if not self.permitted(update) or update.message is None:
             return
         document = update.message.document
-        if document is None or not (document.mime_type or "").startswith("image/"):
+        if document is None:
+            return
+        if not (document.mime_type or "").startswith("image/"):
+            # A PDF used to land here and get silence, which is what a stranger
+            # who is not on the allowlist gets, so the bot looked broken to
+            # someone doing nothing wrong. Invariant 10's 2026-08-11 exception
+            # is what lets this say which types do work.
+            log.info("refused a %s document, nothing was read", document.mime_type or "unknown")
+            await update.message.reply_text(UNREADABLE_FILE_MESSAGE)
             return
         file = await document.get_file()
         data = bytes(await file.download_as_bytearray())

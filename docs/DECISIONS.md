@@ -1862,6 +1862,36 @@ same class as the `average_minor` bug closed earlier the same day. Both are
 integer now, and `compact` scales the way the currency is spoken: lakh and crore
 for rupees, thousand and million for everything else.
 
+### 2026-08-11: invariant 10 gains one exception, for a file type nothing can read
+
+A PDF sent to the bot produced no reply at all. `on_document` accepted
+`image/*` and returned silently for everything else, so an unreadable file was
+indistinguishable from the bot being down. Silence is reserved for senders who
+are not on the allowlist, where it is the point: a reply confirms the bot exists
+to whoever is probing it. A permitted user sending the wrong file type has done
+nothing wrong and had been getting the same treatment.
+
+Ashrit asked for a message naming what does work. That is an instruction about
+how to send a receipt, which invariant 10 forbids, and CLAUDE.md says the list
+does not change without him saying so explicitly. Raised, and he chose to amend
+the invariant rather than accept a thinner message.
+
+**Invariant 10 now reads:** the bot never instructs the user to change how they
+send a receipt, with one exception: when it receives a file type it cannot read
+at all, it may name the types it can.
+
+**The exception is narrow on purpose.** It applies when no receipt is in flight,
+so there is nothing to resend differently and the choice is between naming what
+works and saying nothing. Coaching somebody through a photo that *did* arrive
+stays forbidden, and `UNREADABLE_FILE_MESSAGE` is tested against the same banned
+list as every other message: crop, retake, rotate, better lighting, resend.
+
+PDFs remain unsupported, which is the 2026-08-08 decision that made the router
+image-only and left `pdfplumber` allowlisted and unused. Rendering a PDF page to
+an image would reopen commit 5's router proposal, need a new dependency under
+invariant 12, and need a ruling on whether rendering counts as altering an image
+under invariant 9. None of that was worth doing to avoid one sentence.
+
 ---
 
 ## Still open

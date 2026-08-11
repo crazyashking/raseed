@@ -24,7 +24,13 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from conftest import as_extraction_payload
-from raseed.adapters.flow import EXPIRED_MESSAGE, FlowConfig, ReceiptFlow, Step
+from raseed.adapters.flow import (
+    EXPIRED_MESSAGE,
+    UNREADABLE_FILE_MESSAGE,
+    FlowConfig,
+    ReceiptFlow,
+    Step,
+)
 from raseed.adapters.images import ImageStore
 from raseed.adapters.pending import InMemoryPendingStore, PendingKey, PendingReceipt
 from raseed.adapters.telegram import (
@@ -168,6 +174,31 @@ def test_an_empty_whitelist_admits_nobody(flow: ReceiptFlow) -> None:
 def test_the_greeting_never_instructs_how_to_send(forbidden: str) -> None:
     """Invariant 10. It may say it could not read one. It may not coach."""
     assert forbidden not in GREETING.lower()
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ["crop", "retake", "rotate", "better lighting", "resend"],
+)
+def test_the_unreadable_file_message_stays_inside_the_exception(forbidden: str) -> None:
+    """Invariant 10's 2026-08-11 exception is narrow, and this is the whole of it.
+
+    Naming the file types that work is allowed, because nothing is in flight to
+    resend and the alternative is the silence a PDF used to get. Coaching
+    somebody through retaking a photo that *did* arrive is still forbidden, and
+    the difference is the entire point of keeping the invariant.
+    """
+    assert forbidden not in UNREADABLE_FILE_MESSAGE.lower()
+
+
+def test_the_unreadable_file_message_says_what_does_work() -> None:
+    """The reason the exception was added at all."""
+    body = UNREADABLE_FILE_MESSAGE.lower()
+    assert "images" in body
+    assert "screenshot" in body
+    assert "paper bill" in body
+    # And it is honest about the money, since refusing costs nothing.
+    assert "nothing was charged" in body
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +374,52 @@ def failing_update(message: Replier | None) -> object:
 
 def error_context(exc: Exception) -> ContextTypes.DEFAULT_TYPE:
     return cast("ContextTypes.DEFAULT_TYPE", SimpleNamespace(error=exc))
+
+
+def document_update(mime_type: str, message: Replier) -> Update:
+    """An update carrying a file rather than a photo."""
+    return cast(
+        "Update",
+        SimpleNamespace(
+            effective_user=SimpleNamespace(id=ALLOWED_ID),
+            message=SimpleNamespace(
+                document=SimpleNamespace(mime_type=mime_type),
+                reply_text=message.reply_text,
+            ),
+        ),
+    )
+
+
+def test_a_pdf_gets_an_answer_rather_than_silence(bot: RaseedBot) -> None:
+    """The reported behaviour: a PDF used to be indistinguishable from a dead bot.
+
+    Silence is what a sender who is not on the allowlist gets, deliberately. A
+    permitted user sending the wrong file type is doing nothing wrong and must
+    not get the same treatment.
+    """
+    message = Replier()
+    update = document_update("application/pdf", message)
+
+    asyncio.run(bot.on_document(update, cast("ContextTypes.DEFAULT_TYPE", None)))
+
+    assert message.said == [UNREADABLE_FILE_MESSAGE]
+
+
+def test_an_unlisted_sender_still_gets_silence_for_a_pdf(flow: ReceiptFlow) -> None:
+    """The whitelist outranks the new message. Replying confirms the bot exists."""
+    closed = RaseedBot(
+        flow=flow,
+        session_factory=cast("sessionmaker[Session]", None),
+        allowed_user_ids=frozenset(),
+        clock=lambda: NOW,
+        user_id_secret=SECRET,
+    )
+    message = Replier()
+    update = document_update("application/pdf", message)
+
+    asyncio.run(closed.on_document(update, cast("ContextTypes.DEFAULT_TYPE", None)))
+
+    assert message.said == []
 
 
 def test_a_crash_gets_a_reply_instead_of_silence(bot: RaseedBot) -> None:

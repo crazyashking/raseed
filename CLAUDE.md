@@ -11,7 +11,10 @@ Violating any of these is a bug, regardless of how convenient it is.
 7. Receipt images are deleted after confirm. Nothing depends on them persisting.
 8. Every table has user_id, even while there is one user.
 9. No image editing, upscaling, or enhancement anywhere in the pipeline.
-10. The bot never instructs the user to change how they send a receipt.
+10. The bot never instructs the user to change how they send a receipt. One
+    exception, added 2026-08-11: when it receives a file type it cannot read at
+    all, it may name the types it can. Nothing is in flight to re-send in that
+    case, and the alternative is silence.
 11. is_receipt is checked before any line item is parsed. A false means store nothing.
 12. No package is installed that is not on the allowlist in the brief. Ask first, always.
 13. line_total_minor is always the amount PAID. discounts[] holds order-level discounts

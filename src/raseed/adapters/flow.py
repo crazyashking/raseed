@@ -102,6 +102,21 @@ EXPIRED_MESSAGE: Final[str] = (
 )
 
 
+#: What a person is told when they send a file this bot cannot read at all.
+#:
+#: This is the one place allowed to name how a receipt can arrive, under the
+#: exception added to invariant 10 on 2026-08-11. The rest of the invariant
+#: stands: nothing here coaches anyone to crop, rotate, retake or resend a
+#: photo that did arrive. The difference is that no receipt is in flight here,
+#: so the choice is between naming what works and saying nothing at all, which
+#: is what a PDF used to get.
+UNREADABLE_FILE_MESSAGE: Final[str] = (
+    "I can only read images at the moment, so I have not read that one. A "
+    "screenshot from an app like Zepto or Blinkit works, and so does a photo "
+    "of a paper bill. Nothing was charged for it."
+)
+
+
 def already_logged_message(logged_on: dt.date, *, charged: bool) -> str:
     """What a person is told when the receipt they sent is already in the ledger.
 
@@ -711,6 +726,7 @@ def summarise(receipt: PendingReceipt) -> str:
 __all__ = [
     "DATE_FORMATS",
     "EXPIRED_MESSAGE",
+    "UNREADABLE_FILE_MESSAGE",
     "FlowConfig",
     "FlowResult",
     "ReceiptFlow",
