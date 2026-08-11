@@ -26,7 +26,7 @@ from telegram.ext import ContextTypes
 from conftest import as_extraction_payload
 from raseed.adapters.flow import EXPIRED_MESSAGE, FlowConfig, ReceiptFlow, Step
 from raseed.adapters.images import ImageStore
-from raseed.adapters.pending import PendingKey, PendingReceipt, PendingStore
+from raseed.adapters.pending import InMemoryPendingStore, PendingKey, PendingReceipt
 from raseed.adapters.telegram import (
     ACTION_ACCEPT_GAP,
     ACTION_CONFIRM,
@@ -109,7 +109,7 @@ def flow(store: ImageStore) -> ReceiptFlow:
     return ReceiptFlow(
         provider=StubProvider(an_extraction()),
         images=store,
-        pending=PendingStore(),
+        pending=InMemoryPendingStore(),
         config=FlowConfig(),
         clock=lambda: NOW,
     )
@@ -196,7 +196,7 @@ def test_a_balanced_receipt_offers_confirm_and_discard(
 ) -> None:
     session, user = seeded
     key = pending_for(flow, session, user)
-    receipt = flow.pending_for(key)
+    receipt = flow.pending_for(session, key)
     assert receipt is not None
 
     markup = keyboard_for(receipt)
@@ -214,12 +214,12 @@ def test_a_class_2_receipt_cannot_be_confirmed_until_the_gap_is_answered(
     gap_flow = ReceiptFlow(
         provider=StubProvider(off_by_a_lot),
         images=store,
-        pending=PendingStore(),
+        pending=InMemoryPendingStore(),
         config=FlowConfig(),
         clock=lambda: NOW,
     )
     key = pending_for(gap_flow, session, user)
-    receipt = gap_flow.pending_for(key)
+    receipt = gap_flow.pending_for(session, key)
     assert receipt is not None
 
     markup = keyboard_for(receipt)
@@ -234,7 +234,7 @@ def test_the_merchant_quick_pick_appears_only_when_unset(
     """Brief 24.4."""
     session, user = seeded
     key = pending_for(flow, session, user)
-    receipt = flow.pending_for(key)
+    receipt = flow.pending_for(session, key)
     assert receipt is not None
 
     offered = keyboard_for(receipt, ["blinkit", "zepto"])
@@ -252,8 +252,8 @@ def test_every_button_carries_its_own_message_id(
 ) -> None:
     """Brief 16.4. Two receipts in flight must not share callback data."""
     session, user = seeded
-    first = flow.pending_for(pending_for(flow, session, user, message_id=10))
-    second = flow.pending_for(pending_for(flow, session, user, message_id=11))
+    first = flow.pending_for(session, pending_for(flow, session, user, message_id=10))
+    second = flow.pending_for(session, pending_for(flow, session, user, message_id=11))
     assert first is not None and second is not None
 
     def data_for(receipt: PendingReceipt) -> set[str]:
@@ -267,7 +267,7 @@ def test_every_button_fits_telegrams_callback_limit(
     seeded: tuple[Session, User], flow: ReceiptFlow
 ) -> None:
     session, user = seeded
-    receipt = flow.pending_for(pending_for(flow, session, user))
+    receipt = flow.pending_for(session, pending_for(flow, session, user))
     assert receipt is not None
     markup = keyboard_for(receipt, ["a-very-long-merchant-slug-indeed", "zepto"])
     for row in markup.inline_keyboard:
@@ -304,7 +304,7 @@ def test_a_merchant_pick_dispatches_with_its_slug(
     session, user = seeded
     key = pending_for(flow, session, user)
     bot.dispatch(session, f"{ACTION_MERCHANT}:blinkit", key)
-    receipt = flow.pending_for(key)
+    receipt = flow.pending_for(session, key)
     assert receipt is not None
     assert receipt.merchant_slug == "blinkit"
 

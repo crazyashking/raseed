@@ -31,6 +31,7 @@ from conftest import as_extraction_payload
 from raseed.db import ledger
 from raseed.db.engine import create_engine
 from raseed.db.models import (
+    SEED_CATEGORIES,
     Base,
     DateSource,
     ReconciliationOutcome,
@@ -489,6 +490,156 @@ def test_a_guessed_date_says_so(seeded: tuple[Session, User]) -> None:
     session.flush()
     html = render_index(session, user)
     assert "date from the message, not the receipt" in html
+
+
+def test_the_tabs_come_from_the_category_table(seeded: tuple[Session, User]) -> None:
+    """Brief section 2: tabs grow from the data, not from a hardcoded list."""
+    session, user = seeded
+    store(session, user, on=TODAY)
+    start, end = data.month_bounds(TODAY)
+    entries = data.tabs(session, user_id=user.id, start=start, end=end)
+
+    assert entries[0].slug is None, "All comes first and is the default landing state"
+    assert entries[0].name == "All"
+    slugs = [e.slug for e in entries[1:]]
+    assert slugs == [slug for slug, _ in SEED_CATEGORIES]
+
+
+def test_an_empty_tab_stays_in_place(seeded: tuple[Session, User]) -> None:
+    """Greyed out rather than hidden, so the nav does not reshuffle monthly."""
+    session, user = seeded
+    store(session, user, on=TODAY)
+    start, end = data.month_bounds(TODAY)
+    entries = data.tabs(session, user_id=user.id, start=start, end=end)
+
+    empty = [e for e in entries if e.empty]
+    assert empty, "this fixture has categories with no spend"
+    assert all(e.slug in {slug for slug, _ in SEED_CATEGORIES} for e in empty)
+
+
+def test_a_category_tab_totals_line_items_not_grand_totals(
+    seeded: tuple[Session, User],
+) -> None:
+    """The bug this guards against would inflate spend past what was paid.
+
+    A receipt's grand total includes delivery, tax and order-level discounts.
+    Those belong to no category, so totalling grand totals under a category
+    filter reports more money than actually left the account.
+    """
+    session, user = seeded
+    store(session, user, on=TODAY)
+
+    rows = data.recent(session, user_id=user.id, category_slug="uncategorized")
+    assert rows, "the fixture's line items are uncategorized"
+
+    for row in rows:
+        assert row.category_minor is not None
+        assert row.amount_minor == row.category_minor
+        assert row.amount_minor <= row.grand_total_minor
+
+    scoped = data.overview(session, user_id=user.id, today=TODAY, category_slug="uncategorized")
+    unscoped = data.overview(session, user_id=user.id, today=TODAY)
+    assert scoped.total_minor <= unscoped.total_minor
+
+
+def test_an_unknown_tab_falls_back_to_all(seeded: tuple[Session, User]) -> None:
+    """A bad slug must not 404 and must not leak which slugs are real."""
+    session, user = seeded
+    store(session, user, on=TODAY)
+    rows = data.recent(session, user_id=user.id, category_slug="no-such-category")
+    assert rows == []
+
+
+def _overview(**kwargs: object) -> data.Overview:
+    defaults: dict[str, object] = {
+        "period_label": "August 2026",
+        "total_minor": 100_00,
+        "receipt_count": 1,
+        "previous_total_minor": 0,
+        "average_minor": 100_00,
+        "flagged_count": 0,
+        "api_spend_micros": 0,
+    }
+    defaults.update(kwargs)
+    return data.Overview(**defaults)  # type: ignore[arg-type]
+
+
+def test_a_long_category_list_folds_into_other() -> None:
+    """Past the limit the list stops ranking and starts being a wall."""
+    slices = [
+        data.Slice(name=f"Category {index}", total_minor=(20 - index) * 100, share=0.05)
+        for index in range(12)
+    ]
+    html = render.dashboard(
+        overview=_overview(),
+        buckets=[data.Bucket("Aug", 100_00, 1)],
+        slices=slices,
+        rows=[],
+        generated_at=NOW,
+    )
+    kept = render.CATEGORY_LIMIT
+    assert "Category 0" in html
+    assert f"Category {kept - 1}" in html
+    # The tail is summarised, not silently dropped: the count says how many.
+    assert f"Other ({len(slices) - kept})" in html
+    assert f"Category {kept}" not in html
+
+
+def test_a_month_with_no_spend_is_drawn_as_empty_not_as_small() -> None:
+    """A one-pixel bar reads as a small amount. Zero is not a small amount."""
+    buckets = [
+        data.Bucket("Jul", 0, 0),
+        data.Bucket("Aug", 500_00, 3),
+    ]
+    html = render.dashboard(
+        overview=_overview(),
+        buckets=buckets,
+        slices=[],
+        rows=[],
+        generated_at=NOW,
+    )
+    assert "Jul: nothing recorded" in html
+    assert "Aug: ₹500.00, 3 receipts" in html
+
+
+def test_the_shell_carries_its_refusal_in_markup_not_in_script() -> None:
+    """The old boot script assigned to `document.body.textContent` on failure.
+
+    That threw the stylesheet away with the rest of the document and left a bare
+    sentence on a blank page, which is what a desktop browser always got. The
+    refusal is now real markup that is merely unhidden.
+    """
+    body = render.shell()
+    # The specific thing that broke: assigning to the body's text threw away the
+    # stylesheet with the rest of the document. Writing text into a single
+    # element is fine and is the safe way to place an untrusted string.
+    assert "body.textContent" not in body
+    assert "document.write" not in body, "replacing the document loses its listeners"
+    head, _, tail = body.partition("<script>")
+    assert "Open this from the Raseed bot in Telegram." in head
+    assert "Open this from the Raseed bot in Telegram." not in tail
+
+
+def test_every_page_offers_the_boot_script_something_to_swap() -> None:
+    """Navigation replaces `#content` in place, so every page must carry one.
+
+    Without this the boot script has nothing to put on screen and the tap looks
+    like it did nothing at all.
+    """
+    pages = {
+        "dashboard": render.dashboard(
+            overview=_overview(),
+            buckets=[data.Bucket("Aug", 100_00, 1)],
+            slices=[],
+            rows=[],
+            generated_at=NOW,
+            tabs=[data.Tab(slug=None, name="All", total_minor=100_00)],
+        ),
+        "not_found": render.not_found(),
+    }
+    for name, html in pages.items():
+        assert 'id="content"' in html, f"{name} has nothing for the boot script to swap"
+        assert 'id="chrome"' in html, f"{name} is missing its persistent chrome"
 
 
 # ---------------------------------------------------------------------------

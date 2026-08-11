@@ -301,7 +301,7 @@ class ReceiptFlow:
             created_at=now,
             image_path=stored.path,
         )
-        self._pending.put(receipt)
+        self._pending.put(session, receipt)
 
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION,
@@ -409,13 +409,13 @@ class ReceiptFlow:
         works on the next tap.
         """
         now = self._clock()
-        receipt = self._pending.get(key, now=now)
+        receipt = self._pending.get(session, key, now=now)
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
 
         raw = session.get(RawExtraction, receipt.raw_extraction_id)
         if raw is None:
-            self._pending.pop(key, now=now)
+            self._pending.pop(session, key, now=now)
             return FlowResult(
                 step=Step.EXPIRED, message="I lost track of that reading. Send it again."
             )
@@ -430,7 +430,7 @@ class ReceiptFlow:
                 session, user_id=receipt.user_id, image_sha256=raw.image_sha256
             )
             if already is not None:
-                self._pending.pop(key, now=now)
+                self._pending.pop(session, key, now=now)
                 self._images.delete(receipt.image_path)
                 return FlowResult(
                     step=Step.DUPLICATE,
@@ -483,12 +483,12 @@ class ReceiptFlow:
             # cheap call, and the alternative is a half-written ledger.
             session.rollback()
             log.exception("confirm hit the duplicate index for %s", key)
-            self._pending.pop(key, now=now)
+            self._pending.pop(session, key, now=now)
             self._images.delete(receipt.image_path)
             return FlowResult(step=Step.DUPLICATE, message="I have already logged that one.")
 
         # Only now. Everything above can fail and leave the button usable.
-        self._pending.pop(key, now=now)
+        self._pending.pop(session, key, now=now)
         self._images.delete(receipt.image_path)
         return FlowResult(
             step=Step.STORED,
@@ -496,47 +496,53 @@ class ReceiptFlow:
             transaction=transaction,
         )
 
-    def discard(self, key: PendingKey) -> FlowResult:
+    def discard(self, session: Session, key: PendingKey) -> FlowResult:
         """Throw a pending receipt away, image and all."""
-        receipt = self._pending.pop(key, now=self._clock())
+        receipt = self._pending.pop(session, key, now=self._clock())
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         self._images.delete(receipt.image_path)
         return FlowResult(step=Step.DISCARDED, message="Discarded. Nothing was saved.")
 
-    def accept_gap(self, key: PendingKey) -> FlowResult:
+    def accept_gap(self, session: Session, key: PendingKey) -> FlowResult:
         """Accept a Class 2 mismatch, to be logged as an unaccounted adjustment."""
         now = self._clock()
-        receipt = self._pending.get(key, now=now)
+        receipt = self._pending.get(session, key, now=now)
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         receipt.gap_accepted = True
+        # Written back explicitly. The in-memory store hands out the very object
+        # it holds, so mutating it was enough; a persistent store hands out a
+        # copy, and relying on aliasing would silently lose the user's answer
+        # the next time the bot restarted.
+        self._pending.put(session, receipt)
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION, message=summarise(receipt), pending=receipt
         )
 
-    def set_merchant(self, key: PendingKey, slug: str) -> FlowResult:
+    def set_merchant(self, session: Session, key: PendingKey, slug: str) -> FlowResult:
         """Attach a merchant picked from the quick-pick keyboard. Brief 24.4."""
         now = self._clock()
-        receipt = self._pending.get(key, now=now)
+        receipt = self._pending.get(session, key, now=now)
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
         receipt.merchant_slug = slug
+        self._pending.put(session, receipt)  # See `accept_gap`: aliasing is not portable.
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION, message=summarise(receipt), pending=receipt
         )
 
-    def pending_for(self, key: PendingKey) -> PendingReceipt | None:
+    def pending_for(self, session: Session, key: PendingKey) -> PendingReceipt | None:
         """Look at a waiting receipt without deciding anything about it.
 
         The transport needs this to re-render a keyboard, and a read must not
         consume the entry the way `confirm` and `discard` do.
         """
-        return self._pending.get(key, now=self._clock())
+        return self._pending.get(session, key, now=self._clock())
 
-    def expire_stale(self) -> list[PendingReceipt]:
+    def expire_stale(self, session: Session) -> list[PendingReceipt]:
         """Drop timed-out receipts and delete their images. Invariant 7."""
-        dead = self._pending.expire(now=self._clock())
+        dead = self._pending.expire(session, now=self._clock())
         for receipt in dead:
             self._images.delete(receipt.image_path)
         return dead

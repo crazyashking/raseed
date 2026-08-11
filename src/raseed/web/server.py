@@ -1,10 +1,12 @@
 """The dashboard's HTTP server, on the standard library.
 
 No web framework. A framework would be the right call for a service with
-sessions, forms, uploads and concurrency; this has none of those. It is four
-read-only routes for one user. `http.server` covers that without adding a
-package to a project whose section 23.1 allowlist does not have one, and
-invariant 12 says an install is a conversation, not a convenience.
+sessions, forms, uploads and concurrency; this has none of those. It is a
+handful of read-only GET routes, and the only input any of them takes is one
+optional category slug that is matched against the user's own category table.
+`http.server` covers that without adding a package to a project whose section
+23.1 allowlist does not have one, and invariant 12 says an install is a
+conversation, not a convenience.
 
 **It still binds to 127.0.0.1 and nothing else**, and now that there is a public
 address that matters more, not less. Cloudflare Tunnel makes an outbound
@@ -35,7 +37,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Final
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -126,19 +128,42 @@ class Dashboard:
             session.commit()
         return user_id
 
-    def index(self, user_id: str) -> str:
+    def index(self, user_id: str, tab: str | None = None) -> str:
+        """The dashboard, optionally scoped to one category tab.
+
+        An unknown `tab` falls back to All rather than 404ing. A stranger who
+        got this far is already authenticated, but there is still no reason to
+        turn the nav into an oracle that reports which category slugs exist.
+        """
         now = self._clock()
         today = now.date()
         with self._sessions() as session:
             start, end = data.month_bounds(today)
+            entries = data.tabs(session, user_id=user_id, start=start, end=end)
+
+            active = next((e for e in entries if e.slug is not None and e.slug == tab), None)
+            slug = active.slug if active else None
+
+            slices = (
+                data.top_items(session, user_id=user_id, start=start, end=end, category_slug=slug)
+                if slug is not None
+                else data.category_totals(session, user_id=user_id, start=start, end=end)
+            )
             return render.dashboard(
-                overview=data.overview(session, user_id=user_id, today=today),
+                overview=data.overview(session, user_id=user_id, today=today, category_slug=slug),
                 buckets=data.monthly_totals(
-                    session, user_id=user_id, months=CHART_MONTHS, today=today
+                    session,
+                    user_id=user_id,
+                    months=CHART_MONTHS,
+                    today=today,
+                    category_slug=slug,
                 ),
-                slices=data.category_totals(session, user_id=user_id, start=start, end=end),
-                rows=data.recent(session, user_id=user_id, limit=RECENT_LIMIT),
+                slices=slices,
+                rows=data.recent(session, user_id=user_id, limit=RECENT_LIMIT, category_slug=slug),
                 generated_at=now,
+                tabs=entries,
+                active_tab=slug,
+                active_tab_name=active.name if active else None,
             )
 
     def receipt(self, user_id: str, transaction_id: str) -> str | None:
@@ -195,7 +220,8 @@ def handler_for(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
                 return None
 
         def do_GET(self) -> None:
-            path = urlparse(self.path).path.rstrip("/") or "/"
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
 
             if path == "/health":
                 # Deliberately open and deliberately empty. The tunnel and any
@@ -214,12 +240,15 @@ def handler_for(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
             user_id = self._authenticated()
             if user_id is None:
                 return
-            status, body = self._route(path, user_id)
+            status, body = self._route(path, user_id, parse_qs(parsed.query))
             self._send(status, body)
 
-        def _route(self, path: str, user_id: str) -> tuple[HTTPStatus, str]:
+        def _route(
+            self, path: str, user_id: str, query: dict[str, list[str]]
+        ) -> tuple[HTTPStatus, str]:
             if path == "/app":
-                return HTTPStatus.OK, dashboard.index(user_id)
+                tabs = query.get("tab") or []
+                return HTTPStatus.OK, dashboard.index(user_id, tabs[0] if tabs else None)
 
             if path.startswith("/receipt/"):
                 page = dashboard.receipt(user_id, path.removeprefix("/receipt/"))
@@ -237,8 +266,18 @@ def handler_for(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            """Route access logs through logging instead of stderr."""
-            log.debug("%s %s", self.address_string(), format % args)
+            """Route access logs through logging instead of stderr.
+
+            The client string is here because the one question this log has to
+            answer is which client opened the page, and DEBUG is already the
+            level you turn on when the answer matters.
+            """
+            log.debug(
+                "%s %s [%s]",
+                self.address_string(),
+                format % args,
+                self.headers.get("User-Agent", "-"),
+            )
 
     return Handler
 

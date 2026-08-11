@@ -1453,6 +1453,187 @@ exactly like a regression in the cost cap and was not one: a test that reads the
 real clock while the code reads an injected one is a test that reports the date,
 not the behaviour.
 
+### 2026-08-09: the dashboard is previewed on disk, not unlocked on the server
+
+Opening `http://127.0.0.1:8770` in a desktop browser correctly shows the "open
+this from the bot" card and no data, because every route except `/` requires a
+signed Telegram `initData`. That is the W2 security model working, but it also
+means the page cannot be looked at at all until `cloudflared` is running, which
+makes it impossible to judge or iterate on the design.
+
+The obvious fix, an environment-gated dev bypass on loopback, was **rejected**.
+It would put a permanent authentication hole in a repo that is going public, one
+commit after the commit whose entire purpose was adding authentication, and the
+interlock protecting it (refuse to start when `DASHBOARD_PUBLIC_URL` is set)
+would be one careless `.env` edit away from being the only thing standing
+between a public tunnel and an open ledger.
+
+`tools/preview_dashboard.py` renders the same pages with the same functions
+straight to disk instead. No server, so no authentication to bypass; nothing in
+`src/` is imported by it and no route is added, so deleting the file leaves the
+application byte-for-byte unchanged. Output goes under `data/`, which is
+gitignored, because those pages contain a real ledger.
+
+### 2026-08-09: the Mini App stopped replacing its own document
+
+Reported live as "the 3rd category gives an error". Not reproducible in desktop
+Chrome, which turned out to be the diagnosis rather than an obstacle to it.
+
+The boot script navigated by calling `document.open(); document.write(html);
+document.close()` and then re-running `wire()` to re-attach its click listener.
+That is only correct where `document.open()` clears event listeners. Chrome
+does, which is why every tab worked there and why a probe confirmed listeners do
+not survive it. Embedded webviews do not all behave that way, and where they do
+not, each navigation leaves another live listener behind: the first tap fires one
+fetch, the second two, the third three, each racing to rewrite the whole
+document. That is a bug whose symptom is "it breaks on the third one".
+
+Navigation now parses the response with `DOMParser` and replaces a single
+`#content` element. The listener is attached exactly once to a document that is
+never torn down, which removes the failure by construction rather than by
+counting. `DOMParser` also does not execute scripts, so the swap cannot run
+anything, which suits a page built out of model-extracted strings. Verified with
+a faked-but-correctly-signed `initData` against the live server: twelve
+consecutive navigations, and exactly one fetch per click at every depth.
+
+The same change is what makes motion possible. A document rewrite cannot be
+animated; swapping one element can. The tab bar is now persistent chrome that
+survives navigation, so the active pill transitions rather than being destroyed
+and rebuilt, and a tap highlights optimistically before the network answers.
+Cards stagger in, bars grow from the baseline they are measured against, and
+ranked fills wipe from the left. All of it is switched off under
+`prefers-reduced-motion`, which is a correctness requirement: for some people
+this kind of movement causes nausea.
+
+### 2026-08-09: brief section 17 item 2 corrected (D1)
+
+Section 17 listed commit 2 as "the full Pydantic contract including quantity/unit
+and refund modelling". That contradicted two other sections of the same
+document: 16.7 puts quantity parsing in Stage 2, and 16.8 makes a refund its own
+ledger row. Nothing in the code was wrong. Quantity parsing shipped in commit 9
+where 16.7 says it belongs, and refunds landed in commit 4 as 16.8 requires; only
+the section 17 line was wrong, and it had been wrong since the brief was written.
+
+Corrected with Ashrit's approval on 2026-08-09, which is the rule: documentation
+may be kept accurate without asking, but the brief is his document and a line
+that looks wrong is a conversation, not an edit. Raised as D1 on 2026-08-08,
+carried through four commits, closed here.
+
+### 2026-08-09: pending receipts go on disk, keyed by HMAC
+
+D9, closed. The pending store was a dict, so restarting the bot invalidated
+every outstanding confirm button while the buttons stayed on screen. A receipt
+already read and paid for could then only be resent and paid for again. Its
+deadline was "before friends are invited", and inviting friends was the next
+step.
+
+**Almost nothing is stored.** `raw_extractions` already holds the model's
+response verbatim and is immutable, and both the reconciliation gate and the MRP
+cross-check are pure functions of it. So a `pending_receipts` row carries the
+decisions a human made (an accepted gap, a merchant pick), a pointer to the
+extraction, and the resolved date. Everything else is recomputed on read, for
+free, from data that was already there.
+
+**No Telegram identifier reaches the database.** The lookup key is
+`HMAC(USER_ID_SECRET, "pending:<chat_id>:<message_id>")`, the same construction
+`identity.py` uses for `user_id`. The real key always arrives in the callback
+data, so hashing costs nothing at lookup time, and W3's property holds: a stolen
+database still cannot be turned back into a list of accounts. A test asserts the
+chat and message IDs appear nowhere in the table. `expire()` therefore returns
+receipts carrying a placeholder key, which is honest about what was never
+stored; `flow.expire_stale` only reads `image_path`, which is the one thing
+expiry must act on under invariant 7.
+
+The table is soft-deletable like every table except `raw_extractions`. A pending
+receipt is not ledger data and a hard delete would be defensible, but invariant 2
+is stated without exceptions, and one nullable column is a cheaper price than an
+exception to an invariant.
+
+**Two bugs the tests caught, both from the same root.** The in-memory store
+handed out the very object it held, so `accept_gap` and `set_merchant` mutated
+it in place and never wrote back. Against a persistent store that silently
+discarded the user's answer. Both now call `put` explicitly. And the row's
+`created_at` had to be stamped from the flow's injected clock rather than
+`func.now()`: a row stamped by the database expires against the wall clock while
+everything else reasons about the injected one, which is exactly the bug that
+made a cost-cap test pass or fail depending on the time of day a day earlier.
+
+### 2026-08-09: a category tab totals line items, not grand totals
+
+Brief section 2 says tapping a tab filters everything below it. The tempting
+implementation is to keep showing each receipt's grand total and just hide the
+receipts that do not match. That would be wrong, and quietly: a grand total
+includes delivery, taxes and order-level discounts, and none of those belong to
+any category. A receipt with ₹100 of groceries, ₹40 of snacks and a ₹25 delivery
+fee would report ₹165 under Groceries and ₹165 again under Snacks, so the tabs
+would add up to more money than left the account.
+
+Under a tab, every figure is therefore a sum of matching **line items**:
+`Row.amount_minor` returns the category share, the hero, the chart and the
+receipt list all use it, and each row still prints the receipt's own total
+beside it so the smaller number does not look like a mistake. The hero says
+"Line items only" rather than leaving the reader to work it out. On the All tab
+nothing changes and grand totals are still the right figure.
+
+Two smaller calls fell out of it. `uncategorized` matches both the seeded
+category row and every line whose `category_id` is still NULL, because
+`category_totals` already folds NULL into Uncategorized and the tab has to agree
+with the number printed on the tab. And tab order is the `SEED_CATEGORIES` order
+from brief section 2, not alphabetical and not `created_at`: the seed writes
+every row in one flush, so they share a timestamp and ordering on it returns
+whatever the database feels like.
+
+### 2026-08-09: one hue for spend, and CSS-only tooltips
+
+Spend is a single series, so the dashboard uses a single hue and no legend, and
+rank is carried by bar length and order rather than by colour. The two steps were
+run through the palette validator rather than picked by eye: `#1a7f52` on the
+light surface and `#46a878` on the dark one clear the lightness band, the chroma
+floor and 3:1 contrast against the surface each actually renders on. A
+categorical palette was considered for the category breakdown and dropped: eight
+hues would need a legend, would need to survive colour-vision checks pairwise,
+and would repaint every time the category set changed.
+
+The chart tooltips are pure CSS (`content: attr(data-tip)`). A test asserts that
+no page carrying ledger data contains a `<script>` tag, and that is worth more
+than a nicer tooltip: every string on those pages was produced by a vision model
+reading an image a stranger could have crafted, so the page is built out of
+untrusted input and should not also be executing anything.
+
+### 2026-08-09: a pending store may not open its own connection
+
+`DatabasePendingStore` shipped holding a `session_factory` and opening a fresh
+session per call. Every test passed. The first real receipt after it came back
+`Something went wrong on my end and I did not save that one`, and the log said
+`sqlite3.OperationalError: database is locked`.
+
+It was a deadlock, not contention. `submit_image` has already written
+`raw_extractions` on the caller's session, so that connection holds SQLite's
+single write lock for the rest of the request. `put` then asked a *second*
+connection for the same lock, which only the caller's own commit could release,
+and the caller was blocked waiting for `put` to return. It could never have
+worked. Receipt ingest was dead for every photo from the moment D9 landed.
+
+Every method on `PendingStore` now takes the caller's `session` and none of them
+commit. That also makes the pending row atomic with the extraction it points at,
+which it should always have been: a rollback used to leave a committed pending
+row aimed at an extraction that no longer existed.
+
+The reason the suite missed it is worth more than the fix. `shared_sessions`
+builds SQLite with `StaticPool`, which hands every session **the same
+connection**, precisely so a second store can observe what the first one wrote.
+That also means no two sessions in any test can ever contend for the write lock,
+so code that opens its own connection mid transaction reads as correct. The
+fixture that made D9 testable is what made D9's bug invisible. There is now a
+`file_sessions` fixture on a real database file, where separate sessions are
+separate connections, and two tests that fail with the exact production error
+when the old shape is restored.
+
+Left alone deliberately: the database is still in rollback-journal mode, so a
+dashboard read can briefly block a bot write. That is ordinary contention with a
+five second busy timeout rather than a deadlock, and switching to WAL is a
+storage decision, not a bug fix.
+
 ---
 
 ## Still open

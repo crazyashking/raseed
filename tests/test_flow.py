@@ -7,11 +7,13 @@ injected, so every branch including expiry and the daily cap is reachable.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from conftest import as_extraction_payload
 from raseed.adapters.flow import (
@@ -27,22 +29,27 @@ from raseed.adapters.images import ImageStore, sha256_of
 from raseed.adapters.pending import (
     CALLBACK_DATA_LIMIT,
     CallbackDataTooLongError,
+    DatabasePendingStore,
+    InMemoryPendingStore,
     PendingKey,
-    PendingStore,
 )
 from raseed.db import queries
+from raseed.db.engine import create_engine
 from raseed.db.ledger import NotStorableError, record_extraction, record_transaction
 from raseed.db.models import (
+    Base,
     CategorySource,
     DateSource,
     ExtractionStage,
     LexiconMiss,
+    PendingReceiptRow,
     RawExtraction,
     Source,
     Transaction,
     TransactionLineItem,
     User,
 )
+from raseed.db.seed import bootstrap
 from raseed.enrichment.providers.base import (
     CategorizationProviderResult,
     CategorizationRequest,
@@ -133,7 +140,7 @@ def make_flow(
     return ReceiptFlow(
         provider=provider,
         images=store,
-        pending=PendingStore(),
+        pending=InMemoryPendingStore(),
         config=config or FlowConfig(),
         clock=lambda: now,
         categorizer=categorizer,
@@ -341,7 +348,7 @@ def test_a_failed_confirm_leaves_the_button_usable(
         flow.confirm(session, pending.key)
 
     # The entry is still there, the image is still there, nothing was stored.
-    assert flow.pending_for(pending.key) is not None
+    assert flow.pending_for(session, pending.key) is not None
     assert pending.image_path is not None
     assert pending.image_path.exists()
     assert session.scalars(select(Transaction)).all() == []
@@ -476,7 +483,7 @@ def test_discarding_stores_nothing_and_deletes_the_image(
     pending = submit(flow, session, user).pending
     assert pending is not None
 
-    result = flow.discard(pending.key)
+    result = flow.discard(session, pending.key)
     session.commit()
 
     assert result.step is Step.DISCARDED
@@ -547,7 +554,7 @@ def test_a_class_2_gap_must_be_accepted_before_it_can_be_stored(
     assert result.pending.gap_accepted is False
     assert "off the printed total" in result.message
 
-    accepted = flow.accept_gap(result.pending.key)
+    accepted = flow.accept_gap(session, result.pending.key)
     assert accepted.pending is not None
     assert accepted.pending.gap_accepted is True
 
@@ -560,7 +567,7 @@ def test_an_accepted_gap_is_stored_as_an_adjustment(
     flow = make_flow(StubProvider(an_extraction(grand_total_minor=22400)), store)
     pending = submit(flow, session, user).pending
     assert pending is not None
-    flow.accept_gap(pending.key)
+    flow.accept_gap(session, pending.key)
 
     result = flow.confirm(session, pending.key)
     session.commit()
@@ -685,7 +692,7 @@ def test_a_provider_failure_keeps_the_image(
 
 def test_a_pending_receipt_expires(seeded: tuple[Session, User], store: ImageStore) -> None:
     session, user = seeded
-    pending_store = PendingStore()
+    pending_store = InMemoryPendingStore()
     clock = {"now": NOW}
     flow = ReceiptFlow(
         provider=StubProvider(an_extraction()),
@@ -701,6 +708,345 @@ def test_a_pending_receipt_expires(seeded: tuple[Session, User], store: ImageSto
     assert flow.confirm(session, pending.key).step is Step.EXPIRED
 
 
+# ---------------------------------------------------------------------------
+# D9: a restart must not eat a receipt
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def shared_sessions() -> Iterator[sessionmaker[Session]]:
+    """A ledger several sessions can share, which plain `sqlite://` cannot.
+
+    Every new connection to an anonymous in-memory database gets its own empty
+    one. `StaticPool` hands out the same connection, which is what makes it
+    possible to test that a *second* store sees what the first one wrote.
+    """
+    engine = create_engine(
+        "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine)
+    engine.dispose()
+
+
+PENDING_SECRET = "a-secret-long-enough-to-be-realistic"
+
+
+@pytest.fixture
+def file_sessions(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    """A ledger on disk, where separate sessions are separate connections.
+
+    `shared_sessions` cannot see a whole class of bug. `StaticPool` hands every
+    session the *same* connection, so no two of them can ever contend for
+    SQLite's single write lock, and code that opens its own connection mid
+    transaction looks perfectly correct. On a real file it deadlocks. That is
+    exactly what shipped: the D9 store opened its own session inside a
+    transaction the caller was already holding open, every test passed, and the
+    first real receipt after it came back "something went wrong on my end".
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'ledger.db'}")
+    Base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine)
+    engine.dispose()
+
+
+def test_the_pending_store_does_not_deadlock_against_its_caller(
+    file_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """A pending write must join the caller's transaction, not race it.
+
+    On a real database file this is the whole bug: `submit_image` has already
+    written `raw_extractions` and so holds the write lock, and a store that
+    reaches for a second connection waits on a lock only its own caller can
+    release. Asserting "no exception" is the point.
+    """
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=DatabasePendingStore(secret=PENDING_SECRET),
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+
+    with file_sessions() as session:
+        user_id = bootstrap(session).id
+        session.commit()
+
+    with file_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        # Still inside the transaction that wrote the extraction.
+        assert result.step is Step.AWAITING_CONFIRMATION
+        assert result.pending is not None
+        session.commit()
+
+    with file_sessions() as session:
+        assert flow.confirm(session, result.pending.key).step is Step.STORED
+        session.commit()
+
+    with file_sessions() as session:
+        assert session.scalars(select(Transaction)).all() != []
+
+
+def test_a_pending_row_rolls_back_with_the_extraction_it_points_at(
+    file_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """Sharing the caller's transaction is what makes the pair atomic.
+
+    A store on its own connection commits the pending row immediately, so a
+    caller that later rolls back leaves a row pointing at an extraction that no
+    longer exists.
+    """
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=DatabasePendingStore(secret=PENDING_SECRET),
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+
+    with file_sessions() as session:
+        user_id = bootstrap(session).id
+        session.commit()
+
+    with file_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        assert result.step is Step.AWAITING_CONFIRMATION
+        session.rollback()
+
+    with file_sessions() as session:
+        assert session.scalars(select(PendingReceiptRow)).all() == []
+        assert session.scalars(select(RawExtraction)).all() == []
+
+
+def test_a_restart_does_not_kill_an_outstanding_confirm(
+    shared_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """D9, and the reason it was urgent.
+
+    The in-memory store lost pending receipts on restart while leaving the
+    buttons on screen, so a receipt already read and paid for could only be
+    resent and paid for again. This is that exact sequence.
+    """
+    with shared_sessions() as session:
+        user = bootstrap(session)
+        session.commit()
+        user_id = user.id
+
+    def build() -> ReceiptFlow:
+        return ReceiptFlow(
+            provider=StubProvider(an_extraction()),
+            images=store,
+            pending=DatabasePendingStore(secret=PENDING_SECRET),
+            config=FlowConfig(),
+            clock=lambda: NOW,
+        )
+
+    with shared_sessions() as session:
+        result = build().submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        session.commit()
+    assert result.pending is not None
+    key = result.pending.key
+
+    # The restart. A brand new flow and a brand new store, same database.
+    with shared_sessions() as session:
+        after = build().confirm(session, key)
+        session.commit()
+
+    assert after.step is Step.STORED, "the confirm button died across a restart"
+
+
+def test_a_confirm_still_cannot_be_applied_twice(
+    shared_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """Retiring the row is what stops a double tap becoming a double row."""
+    with shared_sessions() as session:
+        user = bootstrap(session)
+        session.commit()
+        user_id = user.id
+
+    pending_store = DatabasePendingStore(secret=PENDING_SECRET)
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=pending_store,
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+
+    with shared_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        session.commit()
+    assert result.pending is not None
+
+    with shared_sessions() as session:
+        assert flow.confirm(session, result.pending.key).step is Step.STORED
+        session.commit()
+    with shared_sessions() as session:
+        assert flow.confirm(session, result.pending.key).step is Step.EXPIRED
+        assert pending_store.count(session) == 0
+
+
+def test_no_telegram_identifier_reaches_the_database(
+    shared_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """W3 stopped storing Telegram IDs. Persisting pending state must not undo it.
+
+    The chat ID is picked to be long and distinctive so that finding it anywhere
+    in the table's text is proof, not coincidence.
+    """
+    chat_id = 8675309123
+    with shared_sessions() as session:
+        user = bootstrap(session)
+        session.commit()
+        user_id = user.id
+
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=DatabasePendingStore(secret=PENDING_SECRET),
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+    with shared_sessions() as session:
+        flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=chat_id,
+            message_id=4242,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        session.commit()
+
+    with shared_sessions() as session:
+        rows = list(session.scalars(select(PendingReceiptRow)))
+        assert rows, "nothing was stored, so this test proves nothing"
+        blob = " ".join(
+            str(getattr(row, column.name)) for row in rows for column in rows[0].__table__.columns
+        )
+    assert str(chat_id) not in blob
+    assert "4242" not in blob
+
+
+def test_a_stored_pending_receipt_keeps_the_decisions_already_made(
+    shared_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """An accepted gap is a human's answer. A restart must not ask again."""
+    with shared_sessions() as session:
+        user = bootstrap(session)
+        session.commit()
+        user_id = user.id
+
+    pending_store = DatabasePendingStore(secret=PENDING_SECRET)
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=pending_store,
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+    with shared_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        session.commit()
+    assert result.pending is not None
+    key = result.pending.key
+
+    with shared_sessions() as session:
+        flow.accept_gap(session, key)
+        flow.set_merchant(session, key, "blinkit")
+        session.commit()
+
+    fresh = DatabasePendingStore(secret=PENDING_SECRET)
+    with shared_sessions() as session:
+        reloaded = fresh.get(session, key, now=NOW)
+    assert reloaded is not None
+    assert reloaded.gap_accepted is True
+    assert reloaded.merchant_slug == "blinkit"
+
+
+def test_a_persisted_pending_receipt_still_expires(
+    shared_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """Brief 16.4 gives a confirm button 24 hours. Durable is not forever."""
+    with shared_sessions() as session:
+        user = bootstrap(session)
+        session.commit()
+        user_id = user.id
+
+    pending_store = DatabasePendingStore(secret=PENDING_SECRET)
+    clock = {"now": NOW}
+    flow = ReceiptFlow(
+        provider=StubProvider(an_extraction()),
+        images=store,
+        pending=pending_store,
+        config=FlowConfig(),
+        clock=lambda: clock["now"],
+    )
+    with shared_sessions() as session:
+        result = flow.submit_image(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            data=PNG,
+            mime_type="image/png",
+            message_date=NOW,
+        )
+        session.commit()
+    assert result.pending is not None and result.pending.image_path is not None
+
+    clock["now"] = NOW + dt.timedelta(hours=25)
+    with shared_sessions() as session:
+        assert flow.confirm(session, result.pending.key).step is Step.EXPIRED
+
+    with shared_sessions() as session:
+        dead = flow.expire_stale(session)
+        session.commit()
+    assert len(dead) == 1
+    assert not result.pending.image_path.exists(), "invariant 7: the image goes too"
+
+
 def test_expiring_deletes_the_image(seeded: tuple[Session, User], store: ImageStore) -> None:
     """Invariant 7 does not stop applying because the user walked away."""
     session, user = seeded
@@ -708,7 +1054,7 @@ def test_expiring_deletes_the_image(seeded: tuple[Session, User], store: ImageSt
     flow = ReceiptFlow(
         provider=StubProvider(an_extraction()),
         images=store,
-        pending=PendingStore(),
+        pending=InMemoryPendingStore(),
         config=FlowConfig(),
         clock=lambda: clock["now"],
     )
@@ -716,7 +1062,7 @@ def test_expiring_deletes_the_image(seeded: tuple[Session, User], store: ImageSt
     assert pending is not None and pending.image_path is not None
 
     clock["now"] = NOW + dt.timedelta(hours=25)
-    dead = flow.expire_stale()
+    dead = flow.expire_stale(session)
 
     assert len(dead) == 1
     assert not pending.image_path.exists()
@@ -766,8 +1112,8 @@ def every_terminal_message(session: Session, user: User, store: ImageStore) -> d
 
     second = submit(good, session, user, data=PNG + b"2", message_id=3)
     assert second.pending is not None
-    messages[Step.DISCARDED] = good.discard(second.pending.key).message
-    messages[Step.EXPIRED] = good.discard(second.pending.key).message
+    messages[Step.DISCARDED] = good.discard(session, second.pending.key).message
+    messages[Step.EXPIRED] = good.discard(session, second.pending.key).message
 
     failed = make_flow(StubProvider(ProviderTransientError("upstream timed out")), store)
     messages[Step.EXTRACTION_FAILED] = submit(
@@ -976,7 +1322,7 @@ def test_stage_two_runs_on_confirm_not_on_submit(
     assert pending is not None
     assert categorizer.calls == 0
 
-    flow.discard(pending.key)
+    flow.discard(session, pending.key)
     assert categorizer.calls == 0
 
 

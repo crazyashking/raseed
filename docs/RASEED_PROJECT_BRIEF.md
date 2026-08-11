@@ -930,7 +930,10 @@ image as data in the system prompt. One line each, worth having.
 ## 17. Revised commit order
 
 1. Package skeleton, `pyproject.toml`, `.gitignore`, ruff config
-2. `schemas.py`, the full Pydantic contract including quantity/unit and refund modelling
+2. `schemas.py`, the full Pydantic contract. Quantity/unit parsing belongs to Stage 2
+   per 16.7 and lands in commit 9; a refund is its own ledger row per 16.8 and lands in
+   commit 4. Corrected 2026-08-09: this line previously claimed commit 2 covered both,
+   which contradicted 16.7 and 16.8. The code always followed 16.7 and 16.8.
 3. `reconcile.py` and tests, including the `skip_reconciliation` path
 4. `db/models.py` and the first Alembic migration, with `user_id`, `occurred_on_local`,
    `merchant_tz`, `source`, `deleted_at` present from the start

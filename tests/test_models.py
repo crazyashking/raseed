@@ -85,6 +85,9 @@ def test_no_table_was_forgotten() -> None:
         "transaction_line_items",
         "transaction_adjustments",
         "lexicon_misses",
+        # Not ledger data: the queue in front of it, so a restart stops
+        # invalidating confirm buttons that are still on screen.
+        "pending_receipts",
     }
 
 

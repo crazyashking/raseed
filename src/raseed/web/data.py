@@ -23,11 +23,13 @@ import datetime as dt
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from raseed.db.models import (
+    SEED_CATEGORIES,
+    UNCATEGORIZED_SLUG,
     AdjustmentKind,
     Category,
     RawExtraction,
@@ -37,9 +39,11 @@ from raseed.db.models import (
     TransactionLineItem,
 )
 
-#: What a line item with no category is called. Enrichment (commit 9) is what
-#: fills `category_id`; until it exists every line lands here, and the dashboard
-#: says so plainly rather than drawing an empty chart.
+#: What a line item with no category is called. Enrichment (commit 9) fills
+#: `category_id`, so a live line lands here only when it was stored before that
+#: commit or when Stage 2 genuinely could not place it. Brief 3.8 is explicit
+#: that this is a real category and not a failure state, which is why it gets a
+#: tab of its own like any other.
 UNCATEGORIZED: str = "Uncategorized"
 
 
@@ -54,11 +58,36 @@ class Bucket:
 
 @dataclass(frozen=True, slots=True)
 class Slice:
-    """One category's share of a period."""
+    """One category's, or one item's, share of a period."""
 
     name: str
     total_minor: int
     share: float
+    #: How many line items rolled into this. Only meaningful for item slices,
+    #: where "bought 4 times" is the interesting part.
+    count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Tab:
+    """One entry in the top nav. Brief section 2.
+
+    `slug` is the identity, never `name`: brief 3.8 makes display names mutable
+    and says nothing downstream may key off them. `None` is the All tab.
+    """
+
+    slug: str | None
+    name: str
+    total_minor: int
+
+    @property
+    def empty(self) -> bool:
+        """Nothing in this domain this period.
+
+        Rendered greyed out rather than hidden, so the tab order does not
+        reshuffle from month to month (brief section 2).
+        """
+        return self.total_minor == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +102,25 @@ class Row:
     unaccounted_adjustment_minor: int
     date_source: str
     item_count: int
+    #: What this receipt contributed to the *selected category*, when one is
+    #: selected. None on the All tab, where the grand total is the right figure.
+    category_minor: int | None = None
 
     @property
     def flagged(self) -> bool:
         """Whether this row needs a human to look at it."""
         return self.outcome is ReconciliationOutcome.CLASS_2
+
+    @property
+    def amount_minor(self) -> int:
+        """The figure to show and to total.
+
+        On a category tab this is the part of the receipt that belongs to that
+        category, **not** the grand total. Summing grand totals under a category
+        filter would count delivery fees and taxes once per category and produce
+        a "spend" larger than the money that actually left the account.
+        """
+        return self.grand_total_minor if self.category_minor is None else self.category_minor
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,8 +225,61 @@ def _live(user_id: str) -> ColumnElement[bool]:
     return and_(Transaction.user_id == user_id, Transaction.deleted_at.is_(None))
 
 
-def _rows(session: Session, *, user_id: str) -> list[Row]:
-    """Every live transaction with its line count, newest first."""
+def _category_filter(session: Session, *, user_id: str, slug: str) -> ColumnElement[bool] | None:
+    """Match line items in one category, or None if that slug does not exist.
+
+    `uncategorized` is two things at once and has to match both: the seeded
+    category row, and every line item whose `category_id` is still NULL because
+    enrichment has not run over it. `category_totals` already folds NULL into
+    Uncategorized for display, and the tab has to agree with the number the tab
+    itself shows.
+    """
+    category_id = session.scalars(
+        select(Category.id)
+        .where(
+            Category.user_id == user_id,
+            Category.slug == slug,
+            Category.deleted_at.is_(None),
+        )
+        .limit(1)
+    ).first()
+
+    if slug == UNCATEGORIZED_SLUG:
+        if category_id is None:
+            return TransactionLineItem.category_id.is_(None)
+        return or_(
+            TransactionLineItem.category_id == category_id,
+            TransactionLineItem.category_id.is_(None),
+        )
+    if category_id is None:
+        return None
+    return TransactionLineItem.category_id == category_id
+
+
+def _category_subtotals(session: Session, *, user_id: str, slug: str) -> dict[str, int]:
+    """Per transaction, what it spent in one category. Missing key means nothing."""
+    condition = _category_filter(session, user_id=user_id, slug=slug)
+    if condition is None:
+        return {}
+
+    totals: dict[str, int] = defaultdict(int)
+    rows = session.execute(
+        select(TransactionLineItem.transaction_id, TransactionLineItem.line_total_minor)
+        .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
+        .where(_live(user_id), TransactionLineItem.deleted_at.is_(None), condition)
+    )
+    for transaction_id, amount in rows:
+        totals[transaction_id] += amount
+    return dict(totals)
+
+
+def _rows(session: Session, *, user_id: str, category_slug: str | None = None) -> list[Row]:
+    """Every live transaction with its line count, newest first.
+
+    With `category_slug`, only receipts that touched that category come back, and
+    each carries what it contributed to it. See `Row.amount_minor` for why that
+    is not the grand total.
+    """
     transactions = list(
         session.scalars(
             select(Transaction)
@@ -203,32 +299,50 @@ def _rows(session: Session, *, user_id: str) -> list[Row]:
     ):
         counts[txn_id] += 1
 
-    return [
-        Row(
-            id=t.id,
-            occurred_on_local=t.occurred_on_local,
-            grand_total_minor=t.grand_total_minor,
-            currency=t.currency,
-            outcome=t.reconciliation_outcome,
-            unaccounted_adjustment_minor=t.unaccounted_adjustment_minor,
-            date_source=t.date_source.value,
-            item_count=counts[t.id],
+    subtotals = (
+        _category_subtotals(session, user_id=user_id, slug=category_slug)
+        if category_slug is not None
+        else None
+    )
+
+    rows = []
+    for t in transactions:
+        if subtotals is not None and t.id not in subtotals:
+            continue
+        rows.append(
+            Row(
+                id=t.id,
+                occurred_on_local=t.occurred_on_local,
+                grand_total_minor=t.grand_total_minor,
+                currency=t.currency,
+                outcome=t.reconciliation_outcome,
+                unaccounted_adjustment_minor=t.unaccounted_adjustment_minor,
+                date_source=t.date_source.value,
+                item_count=counts[t.id],
+                category_minor=None if subtotals is None else subtotals[t.id],
+            )
         )
-        for t in transactions
-    ]
+    return rows
 
 
-def monthly_totals(session: Session, *, user_id: str, months: int, today: dt.date) -> list[Bucket]:
+def monthly_totals(
+    session: Session,
+    *,
+    user_id: str,
+    months: int,
+    today: dt.date,
+    category_slug: str | None = None,
+) -> list[Bucket]:
     """The last `months` calendar months, oldest first, gaps included as zero.
 
     A month with no receipts is a real fact about the data and gets a bar of
     zero rather than being dropped, which would make the chart lie about time.
     """
     by_month: dict[str, tuple[int, int]] = {}
-    for row in _rows(session, user_id=user_id):
+    for row in _rows(session, user_id=user_id, category_slug=category_slug):
         key = month_key(row.occurred_on_local)
         total, count = by_month.get(key, (0, 0))
-        by_month[key] = (total + row.grand_total_minor, count + 1)
+        by_month[key] = (total + row.amount_minor, count + 1)
 
     buckets: list[Bucket] = []
     cursor = today.replace(day=1)
@@ -276,21 +390,23 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
     ]
 
 
-def overview(session: Session, *, user_id: str, today: dt.date) -> Overview:
+def overview(
+    session: Session, *, user_id: str, today: dt.date, category_slug: str | None = None
+) -> Overview:
     """The headline figures for the month `today` falls in."""
     start, end = month_bounds(today)
     prev_start, prev_end = month_bounds(previous_month(today))
 
-    rows = _rows(session, user_id=user_id)
+    rows = _rows(session, user_id=user_id, category_slug=category_slug)
     current = [r for r in rows if start <= r.occurred_on_local <= end]
     previous = [r for r in rows if prev_start <= r.occurred_on_local <= prev_end]
 
-    total = sum(r.grand_total_minor for r in current)
+    total = sum(r.amount_minor for r in current)
     return Overview(
         period_label=month_label(today),
         total_minor=total,
         receipt_count=len(current),
-        previous_total_minor=sum(r.grand_total_minor for r in previous),
+        previous_total_minor=sum(r.amount_minor for r in previous),
         average_minor=round(total / len(current)) if current else 0,
         flagged_count=sum(1 for r in rows if r.flagged),
         api_spend_micros=api_spend_micros(session, user_id=user_id),
@@ -312,8 +428,108 @@ def api_spend_micros(session: Session, *, user_id: str) -> int:
     return total
 
 
-def recent(session: Session, *, user_id: str, limit: int = 25) -> list[Row]:
-    return _rows(session, user_id=user_id)[:limit]
+def recent(
+    session: Session, *, user_id: str, limit: int = 25, category_slug: str | None = None
+) -> list[Row]:
+    return _rows(session, user_id=user_id, category_slug=category_slug)[:limit]
+
+
+def tabs(session: Session, *, user_id: str, start: dt.date, end: dt.date) -> list[Tab]:
+    """The top nav. Brief section 2.
+
+    Driven by the category table so a new domain needs no code change, in the
+    table's own order so the tabs do not reshuffle as spend moves around. All
+    comes first and is the default landing state; a domain with nothing in it
+    this period stays in place and renders greyed out.
+    """
+    # Deliberately reusing `category_totals` rather than running a second query:
+    # the number on a tab and the number in the breakdown below it have to be
+    # the same number, and the surest way to guarantee that is one source.
+    # It keys on display name because that is what a Slice carries. Slugs are
+    # unique and display names are not, so two categories renamed to the same
+    # thing would share a tab figure. Nothing seeds that, and the alternative
+    # duplicates the NULL-folding rule that Uncategorized depends on.
+    totals = {
+        slice_.name: slice_.total_minor
+        for slice_ in category_totals(session, user_id=user_id, start=start, end=end)
+    }
+
+    categories = list(
+        session.scalars(
+            select(Category).where(Category.user_id == user_id, Category.deleted_at.is_(None))
+        )
+    )
+
+    # The seeded set keeps the order brief section 2 prints, which is a
+    # deliberate ordering and not alphabetical. Sorting on `created_at` alone
+    # does not work: the seed writes every row in one flush, so they share a
+    # timestamp and fall back to whatever the database returns. Anything added
+    # later appends, in the order it was added.
+    seed_order = {slug: index for index, (slug, _) in enumerate(SEED_CATEGORIES)}
+    last = len(seed_order)
+    categories.sort(key=lambda c: (seed_order.get(c.slug, last), c.created_at, c.slug))
+
+    return [
+        Tab(slug=None, name="All", total_minor=sum(totals.values())),
+        *(
+            Tab(
+                slug=category.slug,
+                name=category.display_name,
+                total_minor=totals.get(category.display_name, 0),
+            )
+            for category in categories
+        ),
+    ]
+
+
+def top_items(
+    session: Session,
+    *,
+    user_id: str,
+    start: dt.date,
+    end: dt.date,
+    category_slug: str,
+    limit: int = 8,
+) -> list[Slice]:
+    """The biggest line items inside one category, for the drill-down.
+
+    Brief section 2 wants domain, then category, then item. There are no
+    sub-categories in v0 (brief 3.8), so a domain drills straight to its items.
+    Names are grouped verbatim as printed; normalising them here would be
+    Stage 2's job, not the dashboard's.
+    """
+    condition = _category_filter(session, user_id=user_id, slug=category_slug)
+    if condition is None:
+        return []
+
+    totals: dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
+    rows = session.execute(
+        select(TransactionLineItem.raw_name, TransactionLineItem.line_total_minor)
+        .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
+        .where(
+            _live(user_id),
+            TransactionLineItem.deleted_at.is_(None),
+            Transaction.occurred_on_local >= start,
+            Transaction.occurred_on_local <= end,
+            condition,
+        )
+    )
+    for name, amount in rows:
+        totals[name] += amount
+        counts[name] += 1
+
+    grand = sum(totals.values())
+    ranked = sorted(totals.items(), key=lambda kv: -kv[1])[:limit]
+    return [
+        Slice(
+            name=name,
+            total_minor=amount,
+            share=(amount / grand) if grand else 0.0,
+            count=counts[name],
+        )
+        for name, amount in ranked
+    ]
 
 
 def flagged(session: Session, *, user_id: str) -> list[Row]:
@@ -325,8 +541,9 @@ def receipt(session: Session, *, user_id: str, transaction_id: str) -> Receipt |
     """One transaction with its lines and adjustments, or None if it is not yours.
 
     The `user_id` filter is a security boundary, not an optimisation: a guessed
-    transaction ID must not return another user's receipt. Invariant 8 is why
-    every table carries `user_id` even while there is one user.
+    transaction ID must not return another user's receipt. Invariant 8 put
+    `user_id` on every table back when there was only one, which is why this
+    became a one-line filter rather than a schema change when W3 added more.
     """
     txn = session.scalars(
         select(Transaction).where(_live(user_id), Transaction.id == transaction_id).limit(1)
@@ -401,6 +618,7 @@ __all__ = [
     "Receipt",
     "Row",
     "Slice",
+    "Tab",
     "api_spend_micros",
     "category_totals",
     "flagged",
@@ -412,4 +630,6 @@ __all__ = [
     "previous_month",
     "receipt",
     "recent",
+    "tabs",
+    "top_items",
 ]

@@ -290,6 +290,65 @@ class RawExtraction(Base):
     created_at: Mapped[dt.datetime] = _created_at()
 
 
+class PendingReceiptRow(Base):
+    """A receipt shown to the user and waiting on a Confirm or Discard.
+
+    Nothing here is in the ledger. This is the queue in front of it, and it
+    exists on disk for one reason: it used to live in memory, so restarting the
+    bot invalidated every outstanding confirm button while the buttons stayed on
+    screen. A receipt that had already been read and paid for could then only be
+    resent and paid for again. That cost three real receipts on 2026-08-09.
+
+    Almost nothing is stored here, because almost nothing needs to be.
+    `raw_extractions` already holds the model's response verbatim and is
+    immutable, and the reconciliation and MRP checks are pure functions of it.
+    So this row carries the decisions a human made (a merchant pick, an accepted
+    gap) and a pointer, and the rest is recomputed on read for free.
+
+    **There is no chat identifier here.** `key_hash` is an HMAC of the Telegram
+    chat and message IDs under `USER_ID_SECRET`, the same construction
+    `identity.py` uses for `user_id`. The bot always has the real key in hand
+    when it looks a row up, because the key arrives in the callback data, so
+    nothing is lost by never storing it. A stolen database still cannot be turned
+    back into a list of accounts, which is the property W3 bought and this table
+    must not sell back.
+    """
+
+    __tablename__ = "pending_receipts"
+    __table_args__ = (
+        UniqueConstraint("key_hash", name="uq_pending_receipts_key"),
+        Index("ix_pending_receipts_user", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    #: HMAC-SHA256 of the callback key. Never the key itself. See the docstring.
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    raw_extraction_id: Mapped[str] = mapped_column(ForeignKey("raw_extractions.id"), nullable=False)
+
+    #: Bucketed on later, so it is resolved once here rather than re-guessed.
+    #: Invariant 6.
+    occurred_on_local: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    date_source: Mapped[DateSource] = mapped_column(
+        Enum(DateSource, native_enum=False), nullable=False
+    )
+
+    #: Deleted on confirm or discard. Invariant 7. Null for text entry.
+    image_path: Mapped[str | None] = mapped_column(String(500))
+
+    #: Choices the user already made, which a restart must not throw away.
+    merchant_slug: Mapped[str | None] = mapped_column(String(80))
+    gap_accepted: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    #: Soft, like every table except `raw_extractions`. A pending receipt is not
+    #: ledger data, but invariant 2 is stated without exceptions and one column
+    #: is a cheaper price than an exception.
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Transaction(Base):
     """One purchase, or one refund.
 
@@ -569,6 +628,7 @@ class LexiconMiss(Base):
 #: it is immutable, so there is nothing to mark. Invariant 5.
 SOFT_DELETABLE_TABLES: Final[tuple[str, ...]] = (
     "users",
+    "pending_receipts",
     "merchants",
     "categories",
     "transactions",
@@ -586,6 +646,7 @@ __all__ = [
     "Category",
     "DateSource",
     "Merchant",
+    "PendingReceiptRow",
     "RawExtraction",
     "ReconciliationOutcome",
     "Source",

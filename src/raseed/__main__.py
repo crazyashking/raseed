@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from raseed.adapters.flow import FlowConfig, ReceiptFlow
 from raseed.adapters.images import ImageStore
-from raseed.adapters.pending import PendingStore
+from raseed.adapters.pending import DatabasePendingStore
 from raseed.adapters.telegram import RaseedBot, build_application
 from raseed.config import PROJECT_ROOT, ConfigError, Settings
 from raseed.db.engine import create_engine
@@ -69,7 +69,11 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Sessi
             api_key=settings.gemini_api_key, model_id=settings.gemini_categorizer_model
         ),
         images=images,
-        pending=PendingStore(),
+        # On disk, not in memory: a restart used to invalidate every
+        # outstanding confirm button while leaving it on screen, and a
+        # receipt already read and paid for could only be resent and paid
+        # for again. Keyed by HMAC, so no Telegram ID lands in the database.
+        pending=DatabasePendingStore(secret=settings.user_id_secret),
         config=FlowConfig(
             daily_cost_limit_micros=settings.daily_cost_limit_micros,
             global_daily_cost_limit_micros=settings.global_daily_cost_limit_micros,

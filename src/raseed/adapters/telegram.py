@@ -259,11 +259,11 @@ class RaseedBot:
         if action == ACTION_CONFIRM:
             return self._flow.confirm(session, key)
         if action == ACTION_DISCARD:
-            return self._flow.discard(key)
+            return self._flow.discard(session, key)
         if action == ACTION_ACCEPT_GAP:
-            return self._flow.accept_gap(key)
+            return self._flow.accept_gap(session, key)
         if action.startswith(f"{ACTION_MERCHANT}:"):
-            return self._flow.set_merchant(key, action.split(":", 1)[1])
+            return self._flow.set_merchant(session, key, action.split(":", 1)[1])
         if action == ACTION_EDIT:
             return FlowResult(
                 step=Step.AWAITING_CONFIRMATION,
