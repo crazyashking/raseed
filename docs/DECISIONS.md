@@ -1805,6 +1805,63 @@ that reason, carrying its own message that says the first of next month.
 No new query was needed: `global_spend_micros_since` already takes an arbitrary
 `since`, so the month is the same sum over a different boundary.
 
+### 2026-08-11: a category tab shows what left the account, not what was printed
+
+Reported live by a friend testing the bot: a receipt paid at ₹987.48 showed
+₹1,138.00 under Food & Dining. Nothing was wrong with the money. Extraction, the
+gate and storage were all exact, and invariant 13 held: the line carried the
+printed ₹1,138.00 and the two coupons stayed order-level.
+
+The display was doing what the 2026-08-09 phase 4 decision told it to. Under a
+tab every figure was a sum of line prices, because delivery, tax and order-level
+coupons belong to no single line. **That decision existed to stop the tabs
+summing to more than was ever spent, and on this receipt it produced exactly
+that from the other direction**: two coupons outweighed the fees, so one category
+read higher than the grand total. A number larger than what you paid is read as
+broken, correctly, and the "line items only" footnote does not rescue it.
+
+**Every line item now carries an apportioned share of the grand total.**
+Categories, the breakdown, the item drill-down and the receipt list all derive
+from `data.line_shares`, so they agree by construction rather than by care.
+
+`money.apportion` splits by largest remainder. The parts sum to the total
+exactly, ties break on position so a reload cannot move a paisa between two
+categories, and the sign is carried separately because floor division on a
+negative numerator would hand out more than a refund is worth.
+
+**Storage is untouched.** `line_total_minor` is still the printed price, which
+invariant 13 requires, and the receipt drill-down still shows the receipt as
+printed. This is a display decision and lives entirely in `web/`.
+
+Known and documented in `line_shares`: a receipt with no line items has nothing
+to apportion across and appears under no category. Its money still counts on the
+All tab. That case stopped being hypothetical the same day, when a receipt split
+across two screenshots produced one page of items and one page of totals.
+
+### 2026-08-11: D13 closed, one section per currency, no conversion
+
+`data.py` summed `amount_minor` with no grouping, so cents and paise landed in
+one figure denominated in nothing, and 18 of `render.py`'s 21 `money()` calls
+took the INR default and printed a rupee sign over whatever was stored.
+
+Every aggregate now takes a currency and every carrier states the one it holds.
+The page asks the ledger which currencies a user has, biggest spender first, so
+the currency someone lives in leads and a holiday follows it, and renders a
+hero, chart and breakdown for each.
+
+**Nothing is converted, and that is the decision.** A rate needs a date to be
+read on, and a receipt converted at today's rate and at its own month's rate are
+two different defensible numbers. Approximation has no place in a ledger built
+on exact integers. Job B stays deferred.
+
+Two things `money.py` had wrong, both found by looking rather than by a failing
+test. `money()` assumed two decimal places: ISO 4217 gives the yen none, so
+`JPY 1,200.00` invented two digits, and the dinar three, so two lost a real one.
+And the chart tick computed `minor / 100` and formatted the float, which is the
+same class as the `average_minor` bug closed earlier the same day. Both are
+integer now, and `compact` scales the way the currency is spoken: lakh and crore
+for rupees, thousand and million for everything else.
+
 ---
 
 ## Still open
