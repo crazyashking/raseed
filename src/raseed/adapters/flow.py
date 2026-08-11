@@ -164,6 +164,11 @@ class Step(Enum):
     #: the user did nothing wrong and "you have hit your limit" would be a lie.
     GLOBAL_LIMIT_REACHED = "global_limit_reached"
 
+    #: The budget for EVERYBODY for this calendar month is spent. Told apart from
+    #: `GLOBAL_LIMIT_REACHED` because a daily cap frees itself within a day and
+    #: this one does not, so saying "24 hours" here would be false.
+    GLOBAL_MONTHLY_LIMIT_REACHED = "global_monthly_limit_reached"
+
     #: These exact image bytes are already in the ledger.
     DUPLICATE = "duplicate"
 
@@ -209,9 +214,27 @@ class FlowConfig:
     #: Across every user. Checked first, because a per-user cap says nothing
     #: about the total bill once there is more than one user.
     global_daily_cost_limit_micros: int = 2_000_000
+    #: Across every user, per calendar month. Checked before both daily caps,
+    #: because N days each inside their own budget still sum to the invoice.
+    global_monthly_cost_limit_micros: int = 5_000_000
     default_timezone: str = "Asia/Kolkata"
     tolerance_minor: int = DEFAULT_TOLERANCE_MINOR
     min_confidence: float | None = None
+
+
+def month_start_utc(now: dt.datetime) -> dt.datetime:
+    """Midnight UTC on the first of `now`'s month.
+
+    The monthly cap needs a boundary that a bill would recognise, so this
+    truncates a calendar month instead of subtracting 30 days. See
+    `raseed.config.DEFAULT_GLOBAL_MONTHLY_COST_LIMIT_MICROS` for why the daily
+    caps roll and this one does not.
+
+    UTC because `RawExtraction.created_at` is stored in UTC and this measures
+    when tokens were billed. Invariant 6 governs reporting on when money was
+    spent at a merchant, which this is not; see `queries.spend_micros_since`.
+    """
+    return now.astimezone(dt.UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def parse_printed_date(text: str | None, *, fallback_tz: str) -> dt.date | None:
@@ -386,7 +409,11 @@ class ReceiptFlow:
         )
 
     def _over_budget(self, session: Session, *, user_id: str, now: dt.datetime) -> bool:
-        """Whether either rolling 24 hour API budget is already spent. Brief 16.6."""
+        """Whether any of the three API budgets is already spent. Brief 16.6."""
+        if queries.global_spend_micros_since(session, since=month_start_utc(now)) >= (
+            self._config.global_monthly_cost_limit_micros
+        ):
+            return True
         since = now - dt.timedelta(days=1)
         if queries.global_spend_micros_since(session, since=since) >= (
             self._config.global_daily_cost_limit_micros
@@ -400,10 +427,28 @@ class ReceiptFlow:
     ) -> FlowResult | None:
         """Brief 16.6. Refuse before spending, not after.
 
-        The global cap is checked first and reported differently. A user who has
-        read two receipts today has not hit *their* limit, and telling them they
-        have would be a lie about their own account.
+        Checked widest first: the calendar month, then the global day, then this
+        user's day. Each one says something the next cannot. A user who has read
+        two receipts today has not hit *their* limit, and telling them they have
+        would be a lie about their own account. A month that is spent will not
+        free itself in 24 hours, and saying it will would be a lie about time.
         """
+        month_to_date = queries.global_spend_micros_since(session, since=month_start_utc(now))
+        if month_to_date >= self._config.global_monthly_cost_limit_micros:
+            log.warning(
+                "global monthly cap reached: %d of %d micro-dollars spent this month",
+                month_to_date,
+                self._config.global_monthly_cost_limit_micros,
+            )
+            return FlowResult(
+                step=Step.GLOBAL_MONTHLY_LIMIT_REACHED,
+                message=(
+                    "Raseed has hit its reading budget for this month, so I did "
+                    "not read that one. Nothing is wrong on your side. It resets "
+                    "on the first of next month."
+                ),
+            )
+
         since = now - dt.timedelta(days=1)
 
         everyone = queries.global_spend_micros_since(session, since=since)
@@ -672,6 +717,7 @@ __all__ = [
     "Step",
     "already_logged_message",
     "extraction_failed_message",
+    "month_start_utc",
     "parse_printed_date",
     "rupees",
     "summarise",

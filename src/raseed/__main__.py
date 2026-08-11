@@ -77,6 +77,7 @@ def build(settings: Settings) -> tuple[RaseedBot, ImageStore, sessionmaker[Sessi
         config=FlowConfig(
             daily_cost_limit_micros=settings.daily_cost_limit_micros,
             global_daily_cost_limit_micros=settings.global_daily_cost_limit_micros,
+            global_monthly_cost_limit_micros=settings.global_monthly_cost_limit_micros,
             default_timezone=settings.default_timezone,
             tolerance_minor=settings.reconciliation_tolerance_minor,
         ),

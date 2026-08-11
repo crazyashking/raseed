@@ -160,8 +160,22 @@ def test_settings_load_from_a_dotenv_file(tmp_path: Path) -> None:
     assert settings.daily_cost_limit_micros == 750_000
     assert settings.gemini_model == "gemini-3.6-flash"
     assert settings.global_daily_cost_limit_micros == 2_000_000
+    assert settings.global_monthly_cost_limit_micros == 5_000_000
     assert settings.dashboard_public_url == ""
     assert settings.default_timezone == "Asia/Kolkata"
+
+
+def test_the_monthly_cap_can_be_lowered_from_the_environment(tmp_path: Path) -> None:
+    """The ceiling is the one number standing between a bug and a real invoice."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "TELEGRAM_BOT_TOKEN=t\n"
+        f"USER_ID_SECRET={SECRET}\n"
+        "GEMINI_API_KEY=k\n"
+        "GLOBAL_MONTHLY_COST_LIMIT_USD=1.50\n",
+        encoding="utf-8",
+    )
+    assert Settings.from_env(dotenv_path=env).global_monthly_cost_limit_micros == 1_500_000
 
 
 def test_the_token_leaking_loggers_are_silenced(caplog: pytest.LogCaptureFixture) -> None:

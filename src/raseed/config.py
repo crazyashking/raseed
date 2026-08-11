@@ -44,6 +44,18 @@ DEFAULT_DAILY_COST_LIMIT_MICROS: Final[int] = MICROS_PER_USD
 #: spammer costs $2 rather than a month of Gemini billing.
 DEFAULT_GLOBAL_DAILY_COST_LIMIT_MICROS: Final[int] = 2 * MICROS_PER_USD
 
+#: Five dollars a calendar month, across everybody. The daily caps bound a day,
+#: and a day is not what gets invoiced: $2.00 a day sustained is roughly $62 a
+#: month on the card, which is the exposure that opening the bot up to friends
+#: actually creates. Decided 2026-08-10, built 2026-08-11.
+#:
+#: A **calendar** month, deliberately, while both daily caps roll. A rolling 30
+#: day window does not bound a monthly bill: spend the whole ceiling on the 1st,
+#: let it age out, spend it again on the 31st, and one invoice carries twice the
+#: ceiling. Google bills per calendar month, so this buckets the way the bill
+#: does. See `raseed.adapters.flow.month_start_utc`.
+DEFAULT_GLOBAL_MONTHLY_COST_LIMIT_MICROS: Final[int] = 5 * MICROS_PER_USD
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing or malformed."""
@@ -174,6 +186,9 @@ class Settings:
     #: point of it is that one user staying inside their own budget says nothing
     #: about the total.
     global_daily_cost_limit_micros: int
+    #: Across every user, per calendar month. Checked before both daily caps,
+    #: because a day staying inside its budget says nothing about the invoice.
+    global_monthly_cost_limit_micros: int
     #: The public HTTPS address the dashboard is reachable at, or empty. Telegram
     #: will not open a Mini App over plain HTTP or at 127.0.0.1, so while this is
     #: empty the bot hands over a loopback link instead of a button.
@@ -209,6 +224,9 @@ class Settings:
             ),
             global_daily_cost_limit_micros=_usd_micros(
                 "GLOBAL_DAILY_COST_LIMIT_USD", DEFAULT_GLOBAL_DAILY_COST_LIMIT_MICROS
+            ),
+            global_monthly_cost_limit_micros=_usd_micros(
+                "GLOBAL_MONTHLY_COST_LIMIT_USD", DEFAULT_GLOBAL_MONTHLY_COST_LIMIT_MICROS
             ),
             dashboard_public_url=_https_url("DASHBOARD_PUBLIC_URL"),
             log_level=_optional("LOG_LEVEL", "INFO").upper(),

@@ -21,6 +21,7 @@ from raseed.adapters.flow import (
     FlowResult,
     ReceiptFlow,
     Step,
+    month_start_utc,
     parse_printed_date,
     rupees,
     summarise,
@@ -1615,3 +1616,104 @@ def test_the_global_cap_is_a_rolling_window(
 
     later = make_flow(StubProvider(an_extraction()), store, now=NOW + dt.timedelta(days=2))
     assert submit(later, session, user).step is Step.AWAITING_CONFIRMATION
+
+
+# ---------------------------------------------------------------------------
+# The monthly cap. NOW is 2026-08-08, so the month began on 2026-08-01.
+# ---------------------------------------------------------------------------
+
+
+def test_month_start_utc_truncates_to_the_first() -> None:
+    assert month_start_utc(NOW) == dt.datetime(2026, 8, 1, tzinfo=dt.UTC)
+
+
+def test_month_start_utc_normalises_a_non_utc_clock() -> None:
+    """The boundary is a UTC one wherever the caller's clock is."""
+    kolkata = NOW.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+    assert month_start_utc(kolkata) == dt.datetime(2026, 8, 1, tzinfo=dt.UTC)
+
+
+def test_the_monthly_cap_stops_days_that_are_each_inside_their_own(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The bug the monthly cap exists for.
+
+    Spent on 2 August, so both rolling 24 hour windows are clean on the 8th and
+    only the calendar month can see this money at all. N days each obediently
+    under $2 is still one invoice.
+    """
+    session, user = seeded
+    burn(session, another_user(session), 5_000_000, when=dt.datetime(2026, 8, 2, tzinfo=dt.UTC))
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    assert submit(flow, session, user).step is Step.GLOBAL_MONTHLY_LIMIT_REACHED
+
+
+def test_the_monthly_cap_is_a_calendar_month_and_not_a_rolling_thirty_days(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Why this cap does not roll.
+
+    31 July is inside a rolling 30 day window on 8 August and outside August's
+    invoice. A rolling window would refuse here, and would also let the whole
+    ceiling be spent twice inside one calendar month, which is the thing this
+    cap was added to prevent.
+    """
+    session, user = seeded
+    burn(session, another_user(session), 5_000_000, when=dt.datetime(2026, 7, 31, tzinfo=dt.UTC))
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    assert submit(flow, session, user).step is Step.AWAITING_CONFIRMATION
+
+
+def test_the_monthly_cap_is_checked_before_the_daily_ones(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """With every cap blown at once, the honest answer is the longest one."""
+    session, user = seeded
+    burn(session, user, 5_000_000)
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    assert submit(flow, session, user).step is Step.GLOBAL_MONTHLY_LIMIT_REACHED
+
+
+def test_the_monthly_message_does_not_promise_a_reset_in_24_hours(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A spent month does not free itself tomorrow, and saying so would be a lie."""
+    session, user = seeded
+    burn(session, another_user(session), 5_000_000, when=dt.datetime(2026, 8, 2, tzinfo=dt.UTC))
+
+    flow = make_flow(StubProvider(an_extraction()), store)
+    message = submit(flow, session, user).message.lower()
+
+    assert "nothing is wrong on your side" in message
+    assert "first of next month" in message
+    assert "24 hour" not in message
+    assert "your limit" not in message
+
+
+def test_nothing_is_downloaded_or_paid_for_once_the_monthly_cap_is_hit(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    burn(session, another_user(session), 5_000_000, when=dt.datetime(2026, 8, 2, tzinfo=dt.UTC))
+
+    provider = StubProvider(an_extraction())
+    flow = make_flow(provider, store)
+    submit(flow, session, user)
+
+    assert provider.calls == 0
+    assert list(store.root.glob("*")) == []
+
+
+def test_the_monthly_cap_frees_itself_on_the_first(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    burn(session, another_user(session), 5_000_000, when=dt.datetime(2026, 8, 2, tzinfo=dt.UTC))
+
+    september = make_flow(
+        StubProvider(an_extraction()), store, now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    )
+    assert submit(september, session, user).step is Step.AWAITING_CONFIRMATION

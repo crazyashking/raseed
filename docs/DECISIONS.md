@@ -1774,6 +1774,37 @@ orphan the existing ledger, which is why `identity.py` says it must never change
 them listening on port 111. Nothing here uses NFS, and a firewall rule is a
 worse answer than not running the service.
 
+### 2026-08-11: a monthly cost ceiling, and why it is a calendar month
+
+Decided 2026-08-10 when open signup was priced, built 2026-08-11 at the point
+the allowlist grew from one person to three. Until now every ceiling bounded a
+day: $1.00 per user and $2.00 across everybody, both on a rolling 24 hour
+window. A day is not the unit the card is charged in. $2.00 a day sustained is
+roughly $62 an invoice, which was the real exposure of letting friends in.
+`GLOBAL_MONTHLY_COST_LIMIT_USD` defaults to $5.00 and is checked before both
+daily caps.
+
+**It buckets on a calendar month while the daily caps roll, and that asymmetry
+is the decision.** A rolling 30 day window does not bound a monthly bill. Spend
+the whole ceiling on the 1st, let it age out, spend it again on the 31st, and
+one invoice carries twice the ceiling. Google bills per calendar month, so the
+cap that is supposed to bound the bill has to bucket the way the bill does.
+`flow.month_start_utc` truncates to midnight UTC on the first.
+
+**UTC, and invariant 6 is not in play.** Invariant 6 governs reporting on when
+money was spent at a merchant, and this measures when tokens were billed.
+`queries.spend_micros_since` already drew that line for the daily cap and the
+same reasoning carries: a receipt from last month, uploaded today, costs this
+month's budget.
+
+**Widest cap first, because each message is a claim about time.** With every
+ceiling blown at once, reporting the daily one would tell a user their month
+frees itself in 24 hours. `GLOBAL_MONTHLY_LIMIT_REACHED` is its own `Step` for
+that reason, carrying its own message that says the first of next month.
+
+No new query was needed: `global_spend_micros_since` already takes an arbitrary
+`since`, so the month is the same sum over a different boundary.
+
 ---
 
 ## Still open
