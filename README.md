@@ -33,11 +33,15 @@ confirm the row.
 ## Layout
 
 ```
-docs/    the brief, the planner, the decision log
-src/     the package
-tests/   fixtures and the eval harness
-tools/   receipt rendering and lockfile generation
-data/    receipts and eval images, gitignored, never committed
+docs/            the brief, the planner, the decision log, proposals
+src/             the package
+alembic/         the migrations, which own the schema
+tests/           fixtures and the suite
+tools/           operational scripts: eval, enrichment backfill,
+                 dashboard preview, row reassignment, lockfile generation
+templates/       the HTML that renders the synthetic eval receipts
+variations.json  the inputs those receipts are rendered from
+data/            receipts and eval images, gitignored, never committed
 ```
 
 ## Setup
@@ -69,6 +73,7 @@ The checks:
 ```
 .venv\Scripts\python -m pytest
 .venv\Scripts\python -m ruff check .
+.venv\Scripts\python -m ruff format .
 .venv\Scripts\python -m mypy src tests
 .venv\Scripts\python -m pip_audit
 ```

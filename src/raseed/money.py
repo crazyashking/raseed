@@ -22,6 +22,23 @@ def rupees(minor: int) -> str:
     return money(minor, "INR")
 
 
+def average(total_minor: int, count: int) -> int:
+    """The mean of `count` amounts totalling `total_minor`, in whole minor units.
+
+    Integer the whole way. `round(total / count)` reaches the same answer for
+    every amount this ledger will ever hold, and it gets there through a float,
+    which invariant 1 does not allow for money even when the result only ever
+    lands on a screen. Rounds half away from zero, so a mean of -50.5 paise
+    reads as -51 and not as -50: refunds are their own negative rows per brief
+    16.8, so negative means are reachable.
+    """
+    if count == 0:
+        return 0
+    sign = -1 if total_minor < 0 else 1
+    magnitude = abs(total_minor)
+    return sign * ((magnitude + count // 2) // count)
+
+
 def money(minor: int, currency: str = "INR") -> str:
     """Format integer minor units in `currency`.
 
@@ -36,4 +53,4 @@ def money(minor: int, currency: str = "INR") -> str:
     return f"{sign}{prefix}{whole:,}.{fraction:02d}"
 
 
-__all__ = ["SYMBOLS", "money", "rupees"]
+__all__ = ["SYMBOLS", "average", "money", "rupees"]

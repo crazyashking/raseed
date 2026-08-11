@@ -51,7 +51,10 @@ from raseed.extraction.providers.base import (
     ExtractionProvider,
     ExtractionRequest,
     ImagePayload,
+    ProviderBlockedError,
     ProviderError,
+    ProviderResponseError,
+    ProviderTransientError,
 )
 from raseed.money import rupees
 from raseed.timezones import zone
@@ -80,17 +83,75 @@ DATE_FORMATS: Final[tuple[str, ...]] = (
 
 #: What a button says when the state behind it is gone.
 #:
-#: The pending store is in memory (see `adapters.pending`), so a restart drops
-#: every outstanding confirmation while the buttons stay on screen looking live.
-#: "That one is no longer waiting" was true and useless: it reads like a
-#: malfunction and says nothing about whether anything was saved. Naming the two
-#: real causes costs one sentence and turns a support question into a fact.
+#: Two things leave a live-looking button with nothing behind it: the 24 hour
+#: TTL in brief 16.4 running out, or the receipt having already been confirmed
+#: or discarded. A restart was the third and by far the most common, until
+#: `DatabasePendingStore` moved the state to disk on 2026-08-09. The wording
+#: kept naming a restart for two days after that stopped being true, which is
+#: the bot telling a person something false about its own behaviour.
+#:
+#: "That one is no longer waiting" was the version before that: true, and
+#: useless, because it reads like a malfunction and says nothing about whether
+#: money was spent or a row was written.
 #:
 #: It says nothing about *how* to send a receipt. Invariant 10.
 EXPIRED_MESSAGE: Final[str] = (
-    "I do not have that one waiting any more. It either timed out or I was "
-    "restarted since. Nothing was saved."
+    "I do not have that one waiting any more. A confirmation is good for 24 "
+    "hours, and this one either ran out or was already answered. Nothing new "
+    "was saved."
 )
+
+
+def already_logged_message(logged_on: dt.date, *, charged: bool) -> str:
+    """What a person is told when the receipt they sent is already in the ledger.
+
+    Resending is what someone does when they are not sure the first one landed,
+    so the answer is the date it landed on, the fact that it was not counted
+    twice, and somewhere to go and look.
+
+    `charged` separates the two paths, because the difference is real money.
+    A duplicate caught at submit is caught before extraction runs and costs
+    nothing. A duplicate caught at confirm has already paid for Stage 1, and
+    saying otherwise would be a lie told to make a message friendlier.
+
+    Says nothing about *how* to send a receipt. Invariant 10.
+    """
+    free = "" if charged else " Nothing was charged for it."
+    return (
+        f"You have already logged this one, on {logged_on.strftime('%d %b %Y')}."
+        f"{free} I have not counted it twice, so your totals are unchanged. It is "
+        "on your dashboard, and I am ready for the next receipt whenever you are."
+    )
+
+
+def extraction_failed_message(exc: Exception, reference: str) -> str:
+    """What a person is told when extraction fails, and why it is not `str(exc)`.
+
+    Until 2026-08-11 the provider's own exception text went straight into the
+    chat. That text is written by a third party and bounded by nothing: a URL,
+    a request id, sometimes a paragraph of JSON. Showing it to whoever happens
+    to be using the bot is output nobody reviewed, and open signup makes that
+    everybody.
+
+    So the log keeps the whole exception and a person gets two things: the part
+    they can act on, and a reference that ties their report to the log line.
+    The reference is the image digest, which is already computed, already
+    stable, and reveals nothing once the image itself is deleted.
+
+    Says nothing about *how* to send a receipt. Invariant 10.
+    """
+    if isinstance(exc, ProviderTransientError):
+        cause = "I could not reach the service that reads receipts, which is usually temporary."
+    elif isinstance(exc, ProviderBlockedError):
+        cause = "The service that reads receipts refused to process that image."
+    elif isinstance(exc, ProviderResponseError):
+        cause = "The service that reads receipts answered with something I could not use."
+    else:
+        cause = "Something broke on my end."
+    return (
+        f"{cause} I still have your receipt, so nothing is lost. Quote reference "
+        f"{reference} and I can tell you exactly what happened."
+    )
 
 
 class Step(Enum):
@@ -231,7 +292,7 @@ class ReceiptFlow:
             self._images.delete(stored.path)
             return FlowResult(
                 step=Step.DUPLICATE,
-                message=f"Already logged on {existing.occurred_on_local.isoformat()}.",
+                message=already_logged_message(existing.occurred_on_local, charged=False),
                 duplicate_of=existing,
             )
 
@@ -247,13 +308,20 @@ class ReceiptFlow:
             # the wrong thing to spend on one. That is not hypothetical: a DNS
             # failure inside the Gemini SDK arrives as an `httpx` error, which
             # is not an `APIError` and so was never translated at all.
-            detail = f" {exc}"
-            if not isinstance(exc, ProviderError):
-                log.exception("extraction provider raised outside its own error taxonomy")
-                detail = ""
+            # Logged in full, including the cases the taxonomy does cover, and
+            # tagged with a reference. That reference is the only thing tying
+            # "it did not work" from a person to the line in this log that says
+            # what actually happened.
+            reference = stored.sha256[:8]
+            log.warning(
+                "extraction failed, reference=%s, kind=%s",
+                reference,
+                type(exc).__name__ if isinstance(exc, ProviderError) else "outside-taxonomy",
+                exc_info=True,
+            )
             return FlowResult(
                 step=Step.EXTRACTION_FAILED,
-                message=f"I could not read that one right now.{detail}",
+                message=extraction_failed_message(exc, reference),
             )
 
         raw = ledger.record_extraction(
@@ -434,7 +502,7 @@ class ReceiptFlow:
                 self._images.delete(receipt.image_path)
                 return FlowResult(
                     step=Step.DUPLICATE,
-                    message=f"Already logged on {already.occurred_on_local.isoformat()}.",
+                    message=already_logged_message(already.occurred_on_local, charged=True),
                     duplicate_of=already,
                 )
 
@@ -485,7 +553,13 @@ class ReceiptFlow:
             log.exception("confirm hit the duplicate index for %s", key)
             self._pending.pop(session, key, now=now)
             self._images.delete(receipt.image_path)
-            return FlowResult(step=Step.DUPLICATE, message="I have already logged that one.")
+            return FlowResult(
+                step=Step.DUPLICATE,
+                message=(
+                    "That one is already in your ledger. I have not counted it twice, so "
+                    "your totals are unchanged, and it is on your dashboard."
+                ),
+            )
 
         # Only now. Everything above can fail and leave the button usable.
         self._pending.pop(session, key, now=now)

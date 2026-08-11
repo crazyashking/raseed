@@ -134,8 +134,9 @@ def main() -> int:
         port=web.DEFAULT_PORT,
     )
 
-    # A crash between extraction and confirm strands an image on disk, and the
-    # pending store that knew about it lives in memory. Invariant 7.
+    # A crash between extraction and confirm strands an image on disk: the
+    # pending row rolls back with the transaction, the written file does not.
+    # Invariant 7.
     stranded = images.sweep(older_than=now_utc() - dt.timedelta(hours=24))
     if stranded:
         log.info("swept %d stranded receipt image(s)", len(stranded))

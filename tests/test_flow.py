@@ -455,8 +455,12 @@ def test_an_expired_confirm_says_which_thing_happened(
     result = restarted.confirm(session, pending.key)
 
     assert result.step is Step.EXPIRED
-    assert "restarted" in result.message
-    assert "Nothing was saved" in result.message
+    assert "24 hours" in result.message
+    assert "already answered" in result.message
+    assert "Nothing new was saved" in result.message
+    # It no longer blames a restart. `DatabasePendingStore` survives one, so
+    # naming it told the person something false about how the bot behaves.
+    assert "restart" not in result.message.lower()
     # And it does not tell anyone how to send a receipt. Invariant 10.
     for banned in ("crop", "rotate", "as a file", "retake", "better photo"):
         assert banned not in result.message.lower()
@@ -621,7 +625,10 @@ def test_the_same_image_twice_is_caught(seeded: tuple[Session, User], store: Ima
     again = submit(flow, session, user, message_id=2)
     assert again.step is Step.DUPLICATE
     assert again.duplicate_of is not None
-    assert "Already logged on" in again.message
+    assert "already logged this one" in again.message.lower()
+    # Caught before extraction runs, so the claim that it was free is true.
+    assert "Nothing was charged" in again.message
+    assert "dashboard" in again.message.lower()
 
 
 def test_a_soft_deleted_row_does_not_block_a_resend(
@@ -1153,15 +1160,24 @@ def test_no_message_tells_the_user_how_to_send(
         assert not offenders, f"{step.value} coaches the user: {offenders} in {message!r}"
 
 
-def test_a_failure_may_still_say_it_could_not_read_one(
+def test_a_failure_names_the_cause_and_does_not_leak_the_exception(
     seeded: tuple[Session, User], store: ImageStore
 ) -> None:
-    """The other half of invariant 10: silence is not required, only restraint."""
+    """The other half of invariant 10: silence is not required, only restraint.
+
+    The provider's own text is written by a third party and bounded by nothing,
+    so it belongs in the log. A person gets the cause and a reference that ties
+    their report back to the line that has the detail.
+    """
     session, user = seeded
     flow = make_flow(StubProvider(ProviderTransientError("upstream timed out")), store)
     result = submit(flow, session, user)
     assert result.step is Step.EXTRACTION_FAILED
-    assert "could not read" in result.message.lower()
+    assert "could not reach" in result.message.lower()
+    assert "nothing is lost" in result.message.lower()
+    assert "reference" in result.message.lower()
+    # The exception's own words never reach the chat.
+    assert "upstream timed out" not in result.message
 
 
 # ---------------------------------------------------------------------------

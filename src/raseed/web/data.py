@@ -38,6 +38,7 @@ from raseed.db.models import (
     TransactionAdjustment,
     TransactionLineItem,
 )
+from raseed.money import average
 
 #: What a line item with no category is called. Enrichment (commit 9) fills
 #: `category_id`, so a live line lands here only when it was stored before that
@@ -407,7 +408,7 @@ def overview(
         total_minor=total,
         receipt_count=len(current),
         previous_total_minor=sum(r.amount_minor for r in previous),
-        average_minor=round(total / len(current)) if current else 0,
+        average_minor=average(total, len(current)),
         flagged_count=sum(1 for r in rows if r.flagged),
         api_spend_micros=api_spend_micros(session, user_id=user_id),
     )

@@ -1629,10 +1629,73 @@ fixture that made D9 testable is what made D9's bug invisible. There is now a
 separate connections, and two tests that fail with the exact production error
 when the old shape is restored.
 
-Left alone deliberately: the database is still in rollback-journal mode, so a
-dashboard read can briefly block a bot write. That is ordinary contention with a
-five second busy timeout rather than a deadlock, and switching to WAL is a
-storage decision, not a bug fix.
+~~Left alone deliberately: the database is still in rollback-journal mode, so a
+dashboard read can briefly block a bot write.~~ **Wrong when it was written, and
+corrected 2026-08-11.** `db/engine.py` has executed `PRAGMA journal_mode=WAL` on
+every SQLite connection since commit 4, its module docstring says so, and the
+live database reports `journal_mode = wal`. This paragraph is what D11 in the
+planner was built on, and D11 was tracked for three days as work that did not
+exist. See the entry for 2026-08-11.
+
+---
+
+### 2026-08-11: the pre-publish sweep, and what it turned up
+
+Ashrit set the repo going public, on the condition that it carry no dead code,
+no machine-written filler, and none of his personal information. The sweep ran
+over all 94 tracked files and the whole of the git history.
+
+Most of it came back clean: zero unreferenced symbols in `src/`, exactly one
+comment in the package that is not explaining a decision (a section divider), no
+keys, no tokens, no home directory paths, no email addresses, and eval data that
+is synthetic groceries with nothing personal in it. Three things were not clean.
+
+**A live Telegram identifier was being used as documentation.** `identity.py`,
+`tools/claim.py` and this file all illustrated the derivation with
+`123456789`, the account ID of the running bot and the first half of its token.
+The secret half was never committed, so nothing needed rotating, and a public
+repo still should not name a running bot. Replaced with `123456789` and scrubbed
+from history before the first push, which is the only moment that costs nothing.
+
+**D11 never existed.** Traced to the paragraph above this entry, tracked for
+three days as outstanding work, and twice repeated to Ashrit as a prerequisite
+for the hosting move. WAL has been on since commit 4. A tracked claim about the
+code is still only a claim, and one `grep` settles it.
+
+**The bot told people it had been restarted.** `EXPIRED_MESSAGE` named a restart
+as a cause of a dead confirm button. That was true until `DatabasePendingStore`
+moved pending state to disk on 2026-08-09, and false for the two days after. A
+test asserted the stale word, which is how wording outlives the behaviour it
+described.
+
+Three message changes followed. One of them is a policy.
+
+`EXPIRED_MESSAGE` now names the two causes that remain: the 24 hour TTL from
+brief 16.4, and a button that was already used.
+
+The duplicate messages now say what someone resending a receipt wants to know,
+which is that it landed, when it landed, that it was not counted twice, and
+where to go and look at it. The submit path and the confirm path differ on money
+because the difference is real: a duplicate caught at submit is caught before
+extraction and costs nothing, and one caught at confirm has already paid for
+Stage 1. Saying otherwise would be a lie told to make a message friendlier.
+
+**The policy: a provider's own exception text never reaches a chat.** It used
+to. `flow.py` interpolated `str(exc)` directly into the reply, and the Gemini
+provider builds those strings out of raw SDK errors, so a URL, a request id or a
+paragraph of JSON could land in front of whoever was using the bot. Three
+allowlisted people made that survivable. Open signup, which is where this is
+headed, does not. The exception now goes to the log in full, tagged with a
+reference, and the person gets the cause plus that reference. The reference is
+the image digest: already computed, stable, and revealing nothing once the image
+itself is deleted.
+
+Also fixed, and too small to have argued about: `average_minor` came from
+`round(total / len(current))`. That reaches the correct answer for every amount
+this ledger will ever hold, and it reaches it through a float, while invariant 1
+says money is integer minor units and the README says "no floats, anywhere". Now
+`money.average`, integer throughout, rounding half away from zero because
+refunds are their own negative rows per brief 16.8.
 
 ---
 

@@ -392,23 +392,27 @@ def test_the_error_handler_is_registered() -> None:
 def test_a_button_for_an_unknown_receipt_does_not_raise(
     seeded: tuple[Session, User], bot: RaseedBot
 ) -> None:
-    """A restart empties the pending store while the buttons stay on screen."""
+    """A button can outlive its state: the TTL runs out, or it was already used."""
     session, _user = seeded
     result = bot.dispatch(session, ACTION_CONFIRM, PendingKey(chat_id=1, message_id=1))
     assert result.step is Step.EXPIRED
-    assert "restarted" in result.message
+    assert "24 hours" in result.message
 
 
 def test_the_expired_message_names_the_cause_and_the_consequence() -> None:
-    """Found live on 2026-08-09.
+    """Found live on 2026-08-09, and corrected on 2026-08-11.
 
-    Ashrit tapped Confirm on receipts submitted before a restart and got "that
-    one is no longer waiting", which reads like a fault rather than like state
-    that legitimately no longer exists. The wording now says why and says that
-    nothing was saved, without a word about how to send a receipt (invariant 10).
+    The first version said "that one is no longer waiting", which reads like a
+    fault rather than like state that legitimately no longer exists. The second
+    blamed a restart, which was true until `DatabasePendingStore` moved pending
+    state to disk and false for two days afterwards. What is left are the two
+    causes that can actually put a live-looking button in front of someone.
+
+    Still not a word about how to send a receipt. Invariant 10.
     """
-    assert "restarted" in EXPIRED_MESSAGE
-    assert "timed out" in EXPIRED_MESSAGE
-    assert "Nothing was saved" in EXPIRED_MESSAGE
+    assert "24 hours" in EXPIRED_MESSAGE
+    assert "already answered" in EXPIRED_MESSAGE
+    assert "Nothing new was saved" in EXPIRED_MESSAGE
+    assert "restart" not in EXPIRED_MESSAGE.lower()
     for coaching in ("crop", "rotate", "as a file", "retake", "clearer", "better"):
         assert coaching not in EXPIRED_MESSAGE.lower()

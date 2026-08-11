@@ -97,10 +97,11 @@ class ImageStore:
     def sweep(self, *, older_than: dt.datetime) -> list[Path]:
         """Delete images left behind by a restart or an expired confirmation.
 
-        The pending store is in memory, so a crash between extraction and
-        confirm would otherwise strand a receipt image on disk forever. That is
-        the thing invariant 7 exists to prevent, so it gets swept rather than
-        hoped about.
+        A crash between extraction and confirm strands the image: the pending
+        row rolls back with the transaction, and the file already written to
+        disk does not. Three receipts ended up orphaned that way when the
+        pending store deadlocked. That is the thing invariant 7 exists to
+        prevent, so it gets swept rather than hoped about.
         """
         cutoff = older_than.timestamp()
         removed: list[Path] = []
