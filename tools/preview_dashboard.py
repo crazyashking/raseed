@@ -239,23 +239,27 @@ def _demo(out: pathlib.Path) -> int:
     _write(
         out / f"tab-{groceries.slug}.html",
         render.dashboard(
-            overview=data.Overview(
-                period_label=data.month_label(today),
-                total_minor=groceries.total_minor,
-                receipt_count=month_count,
-                previous_total_minor=round(groceries.total_minor * 1.18),
-                average_minor=round(groceries.total_minor / month_count) if month_count else 0,
-                flagged_count=0,
-                api_spend_micros=overview.api_spend_micros,
+            view=data.CurrencyView(
+                overview=data.Overview(
+                    period_label=data.month_label(today),
+                    total_minor=groceries.total_minor,
+                    receipt_count=month_count,
+                    previous_total_minor=round(groceries.total_minor * 1.18),
+                    average_minor=round(groceries.total_minor / month_count) if month_count else 0,
+                    flagged_count=0,
+                    api_spend_micros=overview.api_spend_micros,
+                ),
+                buckets=[
+                    data.Bucket(b.label, round(b.total_minor * 0.41), b.count) for b in buckets
+                ],
+                # Shares are a proportion of these items' own sum, which is what
+                # `data.top_items` computes. Inventing them independently would put
+                # a chart on screen whose bars do not add up.
+                slices=[
+                    data.Slice(name, total, total / _ITEM_SUM, count)
+                    for name, total, count in _DEMO_ITEMS
+                ],
             ),
-            buckets=[data.Bucket(b.label, round(b.total_minor * 0.41), b.count) for b in buckets],
-            # Shares are a proportion of these items' own sum, which is what
-            # `data.top_items` computes. Inventing them independently would put
-            # a chart on screen whose bars do not add up.
-            slices=[
-                data.Slice(name, total, total / _ITEM_SUM, count)
-                for name, total, count in _DEMO_ITEMS
-            ],
             rows=[
                 data.Row(
                     id=row.id,

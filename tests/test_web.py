@@ -15,6 +15,8 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from http import HTTPStatus
@@ -1044,3 +1046,36 @@ def test_a_different_secret_is_a_different_ledger() -> None:
 def test_the_derived_id_does_not_contain_the_account_number() -> None:
     """The whole reason it is an HMAC and not a formatted string."""
     assert str(VISITOR_ID) not in user_id_for(VISITOR_ID, secret=SECRET)
+
+
+# ---------------------------------------------------------------------------
+# The preview tool
+# ---------------------------------------------------------------------------
+
+
+def test_the_preview_tool_still_renders(tmp_path: Path) -> None:
+    """`tools/preview_dashboard.py` is tracked, documented, and was untested.
+
+    It broke on 2026-08-11 when `render.dashboard` took a `CurrencyView` instead
+    of three loose aggregates: two of its three call sites were updated and the
+    third was not, and the whole suite stayed green because nothing here imported
+    it. The pre-push sweep caught it by running it. This runs it instead.
+
+    Driven as a subprocess because that is how it is actually used, and because
+    `tools/` is deliberately not on the import path.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parent.parent / "tools" / "preview_dashboard.py"),
+            "--demo",
+            "--out",
+            str(tmp_path / "preview"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "preview" / "index.html").is_file()
+    assert (tmp_path / "preview" / "tab-groceries.html").is_file()
