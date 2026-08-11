@@ -381,8 +381,9 @@ def _hero(overview: data.Overview, *, scope: str | None = None) -> str:
     if scope:
         eyebrow = f"{scope} in {escape(overview.period_label)}"
         note = (
-            '<div class="hint">Line items only. Delivery, taxes and order-level '
-            "discounts are not part of any category.</div>"
+            '<div class="hint">Delivery, taxes and coupons are shared across '
+            "categories in proportion to what you bought, so the tabs add up to "
+            "your total.</div>"
         )
     else:
         eyebrow = f"Spent in {escape(overview.period_label)}"
@@ -515,8 +516,8 @@ def _categories(slices: list[data.Slice]) -> str:
     )
 
     note = (
-        '<div class="hint">These add up to the basket, not to the total above: '
-        "delivery charges, taxes and order-level discounts sit outside the line items.</div>"
+        '<div class="hint">These add up to the total above. Delivery, taxes and '
+        "coupons are shared out in proportion to what you bought.</div>"
     )
     if all(s.name == data.UNCATEGORIZED for s in slices):
         note = (

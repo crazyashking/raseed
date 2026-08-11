@@ -32,6 +32,7 @@ from raseed.db import ledger
 from raseed.db.engine import create_engine
 from raseed.db.models import (
     SEED_CATEGORIES,
+    UNCATEGORIZED_SLUG,
     Base,
     DateSource,
     ReconciliationOutcome,
@@ -45,7 +46,7 @@ from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ProviderResult
 from raseed.extraction.schemas import ExtractionResult
 from raseed.identity import user_id_for
-from raseed.money import money, rupees
+from raseed.money import apportion, money, rupees
 from raseed.validation.reconcile import reconcile
 from raseed.web import data, render
 from raseed.web.server import Dashboard, handler_for
@@ -131,6 +132,50 @@ def test_money_formats(minor: int, currency: str, text: str) -> None:
 def test_rupees_still_works_after_the_move() -> None:
     """`rupees` moved to `raseed.money`; the bot imports it from there now."""
     assert rupees(21900) == "₹219.00"
+
+
+@pytest.mark.parametrize(
+    ("total", "weights", "expected"),
+    [
+        # The live biryani receipt: one line, so it takes the whole thing.
+        (98748, [113800], [98748]),
+        # Proportional when it divides cleanly.
+        (90000, [60000, 40000], [54000, 36000]),
+        # Nothing to split.
+        (0, [500, 300], [0, 0]),
+        (12345, [], []),
+        # A free item earns nothing, and the rest still sums to the total.
+        (1000, [0, 500], [0, 1000]),
+        # Every weight zero: split evenly rather than losing the money.
+        (100, [0, 0, 0], [34, 33, 33]),
+        # A refund is its own negative row (brief 16.8) and must not overshoot.
+        (-100, [1, 1, 1], [-34, -33, -33]),
+    ],
+)
+def test_apportion_cases(total: int, weights: list[int], expected: list[int]) -> None:
+    assert apportion(total, weights) == expected
+
+
+@pytest.mark.parametrize(
+    ("total", "weights"),
+    [
+        (100, [1, 1, 1]),
+        (98748, [113800]),
+        (1, [1, 1, 1, 1, 1, 1, 1]),
+        (7, [3, 3, 3]),
+        (256_00, [5600, 5000, 3800, 2800, 2000, 1500]),
+        (-999, [17, 4, 12345]),
+    ],
+)
+def test_apportion_never_loses_or_invents_a_paisa(total: int, weights: list[int]) -> None:
+    """The whole point. A page that drops a paisa per category is a page that lies."""
+    assert sum(apportion(total, weights)) == total
+
+
+def test_apportion_is_deterministic_across_calls() -> None:
+    """A reload must not move a paisa between two categories tied on remainder."""
+    once = apportion(100, [1, 1, 1])
+    assert all(apportion(100, [1, 1, 1]) == once for _ in range(5))
 
 
 # ---------------------------------------------------------------------------
@@ -295,24 +340,72 @@ def test_everything_is_uncategorized_until_enrichment_exists(
     assert slices[0].share == pytest.approx(1.0)
 
 
-def test_category_slices_sum_to_the_basket_not_the_grand_total(
-    seeded: tuple[Session, User],
-) -> None:
-    """Charges and taxes sit outside the line items, so they are outside the
-    slices too. The page states this rather than showing a number that does not
-    reconcile."""
+def test_category_slices_sum_to_the_grand_total(seeded: tuple[Session, User]) -> None:
+    """The property a reader assumes without being told.
+
+    Charges, taxes and order-level coupons belong to no single line, so each
+    line carries its apportioned share of them. Reported live on 2026-08-11:
+    Food & Dining showed ₹1,138.00 of biryani on a receipt where ₹987.48 was
+    paid, because two coupons outweighed the fees. A category reading higher
+    than the money that left the account is read as broken, correctly.
+    """
     session, user = seeded
     txn = store(session, user, on=TODAY)
     start, end = data.month_bounds(TODAY)
     slices = data.category_totals(session, user_id=user.id, start=start, end=end)
 
+    assert sum(s.total_minor for s in slices) == txn.grand_total_minor
+
+    # And the printed prices still differ from it, so this is a real
+    # apportionment rather than a fixture where the two happen to agree.
     lines = session.scalars(
         TransactionLineItem.__table__.select().with_only_columns(
             TransactionLineItem.line_total_minor
         )
     ).all()
-    assert sum(s.total_minor for s in slices) == sum(lines)
-    assert sum(s.total_minor for s in slices) != txn.grand_total_minor
+    assert sum(lines) != txn.grand_total_minor
+
+
+def test_the_reported_biryani_receipt_reconciles(seeded: tuple[Session, User]) -> None:
+    """The exact live receipt from 2026-08-11, end to end.
+
+    One ₹1,138.00 line, ₹14.90 platform fee, ₹104.58 tax, and two coupons
+    worth ₹270.00 against a ₹987.48 grand total. One category, so it takes the
+    whole apportioned amount and the tab has to read what was actually paid.
+    """
+    session, user = seeded
+    txn = store(
+        session,
+        user,
+        on=TODAY,
+        line_items=[
+            {
+                "raw_name": "2 x Chicken Boneless Dum Biryani [1/2 Kg].",
+                "quantity_text": None,
+                "mrp_minor": None,
+                "line_total_minor": 113800,
+            }
+        ],
+        charges=[
+            {"label": "Delivery partner fee", "amount_minor": 0},
+            {"label": "Platform fee", "amount_minor": 1490},
+        ],
+        taxes=[{"label": "GST & restaurant packaging", "amount_minor": 10458}],
+        discounts=[
+            {"label": "Coupon applied - TASTYFEST150", "amount_minor": 15000},
+            {"label": "Coupon applied - AXISNEO", "amount_minor": 12000},
+        ],
+        grand_total_minor=98748,
+    )
+    assert txn.grand_total_minor == 98748
+
+    start, end = data.month_bounds(TODAY)
+    slices = data.category_totals(session, user_id=user.id, start=start, end=end)
+    assert [s.total_minor for s in slices] == [98748]
+
+    # The receipt list under that category has to agree with the tab above it.
+    rows = data.recent(session, user_id=user.id, category_slug=UNCATEGORIZED_SLUG)
+    assert [r.amount_minor for r in rows] == [98748]
 
 
 def test_categories_respect_the_period(seeded: tuple[Session, User]) -> None:

@@ -38,7 +38,7 @@ from raseed.db.models import (
     TransactionAdjustment,
     TransactionLineItem,
 )
-from raseed.money import average
+from raseed.money import apportion, average
 
 #: What a line item with no category is called. Enrichment (commit 9) fills
 #: `category_id`, so a live line lands here only when it was stored before that
@@ -117,9 +117,10 @@ class Row:
         """The figure to show and to total.
 
         On a category tab this is the part of the receipt that belongs to that
-        category, **not** the grand total. Summing grand totals under a category
-        filter would count delivery fees and taxes once per category and produce
-        a "spend" larger than the money that actually left the account.
+        category, apportioned so that every tab's figures sum back to the grand
+        total. See `line_shares`. Summing grand totals under a category filter
+        instead would count delivery and tax once per category and report more
+        money than ever left the account.
         """
         return self.grand_total_minor if self.category_minor is None else self.category_minor
 
@@ -257,20 +258,74 @@ def _category_filter(session: Session, *, user_id: str, slug: str) -> ColumnElem
     return TransactionLineItem.category_id == category_id
 
 
+def line_shares(session: Session, *, user_id: str) -> dict[str, int]:
+    """Each live line item's share of what its receipt actually cost.
+
+    Categories hang off line items, and the money that left the account also
+    includes delivery, packaging, tax and order-level coupons, none of which
+    belong to any single line. Summing raw line prices under a category tab
+    therefore reports a figure the account never saw. On a real receipt of
+    2026-08-11 that read ₹1,138.00 of biryani under Food & Dining against a
+    ₹987.48 grand total, because two coupons were worth more than the fees.
+
+    So every line gets its proportional share of the grand total instead, and
+    the shares sum back to it exactly (`money.apportion`). A category tab, the
+    breakdown under it, and the All tab then all agree, which is the property a
+    reader assumes without being told.
+
+    Storage is untouched. `line_total_minor` remains the printed price, which is
+    what invariant 13 requires and what the receipt drill-down still shows.
+
+    A receipt with no line items at all (brief 3.4's `skip_reconciliation` case)
+    has nothing to apportion across and so appears under no category. Its money
+    is still counted on the All tab, which is the only figure that is always the
+    whole truth.
+    """
+    grand_totals: dict[str, int] = {
+        transaction_id: grand
+        for transaction_id, grand in session.execute(
+            select(Transaction.id, Transaction.grand_total_minor).where(_live(user_id))
+        )
+    }
+
+    per_transaction: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for item_id, transaction_id, amount in session.execute(
+        select(
+            TransactionLineItem.id,
+            TransactionLineItem.transaction_id,
+            TransactionLineItem.line_total_minor,
+        )
+        .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
+        .where(_live(user_id), TransactionLineItem.deleted_at.is_(None))
+    ):
+        per_transaction[transaction_id].append((item_id, amount))
+
+    shares: dict[str, int] = {}
+    for transaction_id, items in per_transaction.items():
+        grand = grand_totals.get(transaction_id)
+        if grand is None:
+            continue
+        parts = apportion(grand, [amount for _, amount in items])
+        for (item_id, _), part in zip(items, parts, strict=True):
+            shares[item_id] = part
+    return shares
+
+
 def _category_subtotals(session: Session, *, user_id: str, slug: str) -> dict[str, int]:
     """Per transaction, what it spent in one category. Missing key means nothing."""
     condition = _category_filter(session, user_id=user_id, slug=slug)
     if condition is None:
         return {}
 
+    shares = line_shares(session, user_id=user_id)
     totals: dict[str, int] = defaultdict(int)
     rows = session.execute(
-        select(TransactionLineItem.transaction_id, TransactionLineItem.line_total_minor)
+        select(TransactionLineItem.transaction_id, TransactionLineItem.id)
         .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
         .where(_live(user_id), TransactionLineItem.deleted_at.is_(None), condition)
     )
-    for transaction_id, amount in rows:
-        totals[transaction_id] += amount
+    for transaction_id, item_id in rows:
+        totals[transaction_id] += shares.get(item_id, 0)
     return dict(totals)
 
 
@@ -358,10 +413,9 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
     """Spend by category across a date range, inclusive on both ends.
 
     Categories live on line items, not on transactions, because one grocery
-    order is several categories. That means this sums line totals and therefore
-    excludes charges, taxes and order-level discounts: the slices add up to the
-    basket, not to the grand total. The page says so rather than quietly
-    presenting a number that does not reconcile.
+    order is several categories. Each line carries its apportioned share of the
+    grand total (`line_shares`), so these slices add up to the money that left
+    the account over the range, and the tab bar above them adds up to the same.
     """
     names = {
         c.id: c.display_name
@@ -370,9 +424,10 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
         )
     }
 
+    shares = line_shares(session, user_id=user_id)
     totals: dict[str, int] = defaultdict(int)
     rows = session.execute(
-        select(TransactionLineItem.category_id, TransactionLineItem.line_total_minor)
+        select(TransactionLineItem.category_id, TransactionLineItem.id)
         .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
         .where(
             _live(user_id),
@@ -381,7 +436,8 @@ def category_totals(session: Session, *, user_id: str, start: dt.date, end: dt.d
             Transaction.occurred_on_local <= end,
         )
     )
-    for category_id, amount in rows:
+    for category_id, item_id in rows:
+        amount = shares.get(item_id, 0)
         totals[names.get(category_id, UNCATEGORIZED) if category_id else UNCATEGORIZED] += amount
 
     grand = sum(totals.values())
@@ -498,15 +554,21 @@ def top_items(
     sub-categories in v0 (brief 3.8), so a domain drills straight to its items.
     Names are grouped verbatim as printed; normalising them here would be
     Stage 2's job, not the dashboard's.
+
+    Amounts are apportioned like everything else on this page, so the items
+    listed under a category add up to the category's own figure. That makes an
+    item read slightly under its printed price on a discounted order, which is
+    the honest number: it is what that item cost you once the coupon landed.
     """
     condition = _category_filter(session, user_id=user_id, slug=category_slug)
     if condition is None:
         return []
 
+    shares = line_shares(session, user_id=user_id)
     totals: dict[str, int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
     rows = session.execute(
-        select(TransactionLineItem.raw_name, TransactionLineItem.line_total_minor)
+        select(TransactionLineItem.raw_name, TransactionLineItem.id)
         .join(Transaction, Transaction.id == TransactionLineItem.transaction_id)
         .where(
             _live(user_id),
@@ -516,8 +578,8 @@ def top_items(
             condition,
         )
     )
-    for name, amount in rows:
-        totals[name] += amount
+    for name, item_id in rows:
+        totals[name] += shares.get(item_id, 0)
         counts[name] += 1
 
     grand = sum(totals.values())
@@ -623,6 +685,7 @@ __all__ = [
     "api_spend_micros",
     "category_totals",
     "flagged",
+    "line_shares",
     "month_bounds",
     "month_key",
     "month_label",
