@@ -14,7 +14,7 @@ something that has looked at the images can.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from raseed.extraction import prompts
@@ -112,9 +112,6 @@ class ProviderResult:
     #: Broken out so an unexpectedly expensive receipt is diagnosable.
     thought_tokens: int = 0
 
-    #: Anything the provider wants to keep that does not fit above.
-    extra: dict[str, str] = field(default_factory=dict)
-
 
 class ExtractionProvider(Protocol):
     """What Stage 1 needs from a vision model.
@@ -131,9 +128,12 @@ class ExtractionProvider(Protocol):
     def count_input_tokens(self, request: ExtractionRequest) -> int:
         """How many input tokens this request would cost, without running it.
 
-        Free on Gemini. Called before a paid request so an unexpectedly large
-        image is caught before it is paid for, which matters most for the very
-        tall receipts.
+        Free on Gemini, and used by `tools/eval_extraction.py` to price a sweep
+        before running it. The bot does not call it: brief 16.6's caps refuse
+        before spending on what has already been spent, which bounds the bill
+        without a second call per receipt.
+
+        It is what brief 3.11 measures a very tall receipt with.
         """
         ...
 
