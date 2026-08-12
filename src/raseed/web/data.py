@@ -57,6 +57,11 @@ class Bucket:
     count: int
     #: Never summed across currencies. See `currencies`.
     currency: str = "INR"
+    #: `YYYY-MM`, the identity a bar links to. The label is `Aug`, which repeats
+    #: every year and so cannot be the thing a URL carries.
+    key: str = ""
+    #: Whether this is the month the page is currently showing.
+    selected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +250,26 @@ def month_bounds(day: dt.date) -> tuple[dt.date, dt.date]:
     return start, next_start - dt.timedelta(days=1)
 
 
+def parse_month(text: str | None) -> dt.date | None:
+    """Turn a `YYYY-MM` from a query string into the first of that month.
+
+    Returns None for anything else, and the caller falls back to today. This
+    reads a value a stranger can type, so it refuses rather than guesses: no
+    partial parsing, no two-digit years, and a month outside 1 to 12 is not a
+    month. Authentication happens before this, and that is still no reason to
+    let the URL choose which date arithmetic runs.
+    """
+    if not text or len(text) != 7 or text[4] != "-":
+        return None
+    year, month = text[:4], text[5:]
+    if not (year.isdigit() and month.isdigit()):
+        return None
+    try:
+        return dt.date(int(year), int(month), 1)
+    except ValueError:
+        return None
+
+
 def previous_month(day: dt.date) -> dt.date:
     """Any day in the month before the one `day` falls in."""
     return day.replace(day=1) - dt.timedelta(days=1)
@@ -381,6 +406,7 @@ def _rows(
     user_id: str,
     category_slug: str | None = None,
     currency: str | None = None,
+    within: tuple[dt.date, dt.date] | None = None,
 ) -> list[Row]:
     """Every live transaction with its line count, newest first.
 
@@ -424,6 +450,8 @@ def _rows(
     for t in transactions:
         if subtotals is not None and t.id not in subtotals:
             continue
+        if within is not None and not (within[0] <= t.occurred_on_local <= within[1]):
+            continue
         rows.append(
             Row(
                 id=t.id,
@@ -448,11 +476,16 @@ def monthly_totals(
     today: dt.date,
     category_slug: str | None = None,
     currency: str = "INR",
+    selected: dt.date | None = None,
 ) -> list[Bucket]:
     """The last `months` calendar months, oldest first, gaps included as zero.
 
     A month with no receipts is a real fact about the data and gets a bar of
     zero rather than being dropped, which would make the chart lie about time.
+
+    `today` anchors the window and `selected` marks one bar inside it. They are
+    separate on purpose: picking March must not slide the chart back to
+    October, or the only way home would be five more taps.
     """
     by_month: dict[str, tuple[int, int]] = {}
     for row in _rows(session, user_id=user_id, category_slug=category_slug, currency=currency):
@@ -460,16 +493,20 @@ def monthly_totals(
         total, count = by_month.get(key, (0, 0))
         by_month[key] = (total + row.amount_minor, count + 1)
 
+    chosen = month_key(selected or today)
     buckets: list[Bucket] = []
     cursor = today.replace(day=1)
     for _ in range(months):
-        total, count = by_month.get(month_key(cursor), (0, 0))
+        key = month_key(cursor)
+        total, count = by_month.get(key, (0, 0))
         buckets.append(
             Bucket(
                 label=cursor.strftime("%b"),
                 total_minor=total,
                 count=count,
                 currency=currency,
+                key=key,
+                selected=key == chosen,
             )
         )
         cursor = previous_month(cursor).replace(day=1)
@@ -578,8 +615,16 @@ def recent(
     limit: int = 25,
     category_slug: str | None = None,
     currency: str | None = None,
+    within: tuple[dt.date, dt.date] | None = None,
 ) -> list[Row]:
-    return _rows(session, user_id=user_id, category_slug=category_slug, currency=currency)[:limit]
+    """The receipt list. `within` scopes it to one month, for the month picker."""
+    return _rows(
+        session,
+        user_id=user_id,
+        category_slug=category_slug,
+        currency=currency,
+        within=within,
+    )[:limit]
 
 
 def tabs(

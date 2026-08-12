@@ -133,17 +133,23 @@ class Dashboard:
             session.commit()
         return user_id
 
-    def index(self, user_id: str, tab: str | None = None) -> str:
-        """The dashboard, optionally scoped to one category tab.
+    def index(self, user_id: str, tab: str | None = None, month: str | None = None) -> str:
+        """The dashboard, optionally scoped to one category tab and one month.
 
-        An unknown `tab` falls back to All rather than 404ing. A stranger who
-        got this far is already authenticated, but there is still no reason to
-        turn the nav into an oracle that reports which category slugs exist.
+        An unknown `tab` or an unparseable `month` falls back rather than
+        404ing. A stranger who got this far is already authenticated, and there
+        is still no reason to turn the nav into an oracle that reports which
+        category slugs exist, or to let a URL choose which date arithmetic runs.
+
+        The chart window stays anchored on the real today while `month` moves
+        the selection inside it. Sliding the window to the picked month would
+        mean five taps to get home again.
         """
         now = self._clock()
         today = now.date()
+        picked = data.parse_month(month) or today
         with self._sessions() as session:
-            start, end = data.month_bounds(today)
+            start, end = data.month_bounds(picked)
 
             # Biggest spender first, so the currency someone lives in leads the
             # page. An empty ledger has none, and falls back to the configured
@@ -159,7 +165,7 @@ class Dashboard:
                     overview=data.overview(
                         session,
                         user_id=user_id,
-                        today=today,
+                        today=picked,
                         category_slug=slug,
                         currency=currency,
                     ),
@@ -170,6 +176,7 @@ class Dashboard:
                         today=today,
                         category_slug=slug,
                         currency=currency,
+                        selected=picked,
                     ),
                     slices=(
                         data.top_items(
@@ -192,12 +199,19 @@ class Dashboard:
                 view=views[0],
                 # Receipt rows carry their own currency and are formatted one by
                 # one, so the list stays in date order across all of them.
-                rows=data.recent(session, user_id=user_id, limit=RECENT_LIMIT, category_slug=slug),
+                rows=data.recent(
+                    session,
+                    user_id=user_id,
+                    limit=RECENT_LIMIT,
+                    category_slug=slug,
+                    within=(start, end),
+                ),
                 generated_at=now,
                 tabs=entries,
                 active_tab=slug,
                 active_tab_name=active.name if active else None,
                 extra_views=views[1:],
+                month=data.month_key(picked) if picked != today else None,
             )
 
     def receipt(self, user_id: str, transaction_id: str) -> str | None:
@@ -282,7 +296,12 @@ def handler_for(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
         ) -> tuple[HTTPStatus, str]:
             if path == "/app":
                 tabs = query.get("tab") or []
-                return HTTPStatus.OK, dashboard.index(user_id, tabs[0] if tabs else None)
+                months = query.get("month") or []
+                return HTTPStatus.OK, dashboard.index(
+                    user_id,
+                    tabs[0] if tabs else None,
+                    months[0] if months else None,
+                )
 
             if path.startswith("/receipt/"):
                 page = dashboard.receipt(user_id, path.removeprefix("/receipt/"))

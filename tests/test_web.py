@@ -1079,3 +1079,119 @@ def test_the_preview_tool_still_renders(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "preview" / "index.html").is_file()
     assert (tmp_path / "preview" / "tab-groceries.html").is_file()
+
+
+# ---------------------------------------------------------------------------
+# The month picker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", None, "2026", "2026-13", "2026-00", "26-08", "2026-8", "2026/08", "abcd-ef", "2026-08-01"],
+)
+def test_parse_month_refuses_anything_that_is_not_a_month(text: str | None) -> None:
+    """This reads a value a stranger can type, so it refuses rather than guesses."""
+    assert data.parse_month(text) is None
+
+
+def test_parse_month_reads_a_real_one() -> None:
+    assert data.parse_month("2026-03") == dt.date(2026, 3, 1)
+
+
+def test_picking_a_month_moves_every_figure(seeded: tuple[Session, User]) -> None:
+    """The reported gap: a past month could only be reached by scrolling."""
+    session, user = seeded
+    store(session, user, on=dt.date(2026, 6, 15), grand_total_minor=500_00)
+    store(session, user, on=dt.date(2026, 8, 2), grand_total_minor=100_00)
+
+    june = data.overview(session, user_id=user.id, today=dt.date(2026, 6, 1))
+    assert june.total_minor == 500_00
+    assert june.period_label == "June 2026"
+
+    rows = data.recent(session, user_id=user.id, within=data.month_bounds(dt.date(2026, 6, 1)))
+    assert [r.grand_total_minor for r in rows] == [500_00]
+
+
+def test_the_chart_window_stays_anchored_on_today(seeded: tuple[Session, User]) -> None:
+    """Picking March must not slide the window back to October.
+
+    If it did, the only way home would be five more taps, which is the thing
+    that made scrolling the workaround in the first place.
+    """
+    session, user = seeded
+    buckets = data.monthly_totals(
+        session, user_id=user.id, months=6, today=TODAY, selected=dt.date(2026, 4, 1)
+    )
+    assert [b.label for b in buckets] == ["Mar", "Apr", "May", "Jun", "Jul", "Aug"]
+    assert [b.key for b in buckets if b.selected] == ["2026-04"]
+
+
+def test_with_no_month_picked_the_current_one_is_selected(seeded: tuple[Session, User]) -> None:
+    session, user = seeded
+    buckets = data.monthly_totals(session, user_id=user.id, months=6, today=TODAY)
+    assert [b.key for b in buckets if b.selected] == ["2026-08"]
+
+
+def test_a_tab_link_carries_the_month(seeded: tuple[Session, User]) -> None:
+    """Filtering a past month must not bounce you back to today."""
+    session, user = seeded
+    store(session, user, on=dt.date(2026, 6, 15))
+    entries = data.tabs(
+        session, user_id=user.id, start=dt.date(2026, 6, 1), end=dt.date(2026, 6, 30)
+    )
+    html = render.dashboard(
+        view=data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=dt.date(2026, 6, 1)),
+            buckets=data.monthly_totals(
+                session, user_id=user.id, months=6, today=TODAY, selected=dt.date(2026, 6, 1)
+            ),
+            slices=[],
+        ),
+        rows=[],
+        generated_at=NOW,
+        tabs=entries,
+        month="2026-06",
+    )
+    assert "month=2026-06" in html
+    # And a bar link carries the tab, or tapping a month would silently widen
+    # what you were looking at.
+    assert 'href="/app?month=2026-05"' in html
+
+
+def test_a_bar_link_keeps_the_active_tab(seeded: tuple[Session, User]) -> None:
+    session, user = seeded
+    store(session, user, on=TODAY)
+    html = render.dashboard(
+        view=data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=TODAY),
+            buckets=data.monthly_totals(session, user_id=user.id, months=6, today=TODAY),
+            slices=[],
+        ),
+        rows=[],
+        generated_at=NOW,
+        tabs=data.tabs(session, user_id=user.id, start=TODAY, end=TODAY),
+        active_tab=UNCATEGORIZED_SLUG,
+        active_tab_name="Uncategorized",
+    )
+    assert f"tab={UNCATEGORIZED_SLUG}&amp;month=2026-07" in html
+
+
+def test_the_selected_month_is_not_carried_by_colour_alone(seeded: tuple[Session, User]) -> None:
+    """Nothing on this page means something by colour alone."""
+    session, user = seeded
+    # The chart draws an empty card when nothing was spent at all, so there has
+    # to be a bar for the selection to be carried on.
+    store(session, user, on=dt.date(2026, 5, 12))
+    html = render.dashboard(
+        view=data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=TODAY),
+            buckets=data.monthly_totals(
+                session, user_id=user.id, months=6, today=TODAY, selected=dt.date(2026, 5, 1)
+            ),
+            slices=[],
+        ),
+        rows=[],
+        generated_at=NOW,
+    )
+    assert 'aria-current="true"' in html

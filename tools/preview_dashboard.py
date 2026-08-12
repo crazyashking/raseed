@@ -55,9 +55,19 @@ OUT: pathlib.Path = pathlib.Path("data/preview")
 
 
 def _rewrite(html: str) -> str:
-    """Point in-page links at the generated files instead of at server routes."""
+    """Point in-page links at the generated files instead of at server routes.
+
+    Links carry a month as well as a tab now. This preview renders one file per
+    tab and not one per month, so the month is dropped here rather than becoming
+    part of a filename that was never written. Tapping a bar therefore does
+    nothing on the filesystem, which is honest: the month picker is a server
+    round trip and there is no server here.
+    """
     html = re.sub(r'href="/receipt/([^"]+)"', r'href="receipt-\1.html"', html)
-    html = re.sub(r'href="/app\?tab=([^"]+)"', r'href="tab-\1.html"', html)
+    html = re.sub(
+        r'href="/app\?tab=([a-z0-9_-]+)(?:&amp;month=[\d-]+)?"', r'href="tab-\1.html"', html
+    )
+    html = re.sub(r'href="/app\?month=[\d-]+"', 'href="index.html"', html)
     html = html.replace('href="/app"', 'href="index.html"')
     return html.replace('href="/"', 'href="index.html"')
 
@@ -173,7 +183,16 @@ def _demo(out: pathlib.Path) -> int:
         empty = index == 4
         total = 0 if empty else rng.randint(180_00, 940_00)
         count = 0 if empty else rng.randint(2, 9)
-        buckets.append(data.Bucket(cursor.strftime("%b"), total, count))
+        buckets.append(
+            data.Bucket(
+                label=cursor.strftime("%b"),
+                total_minor=total,
+                count=count,
+                key=data.month_key(cursor),
+                # The newest bar is the one the real page lands on.
+                selected=index == 0,
+            )
+        )
         cursor = data.previous_month(cursor).replace(day=1)
     buckets.reverse()
 
@@ -250,7 +269,14 @@ def _demo(out: pathlib.Path) -> int:
                     api_spend_micros=overview.api_spend_micros,
                 ),
                 buckets=[
-                    data.Bucket(b.label, round(b.total_minor * 0.41), b.count) for b in buckets
+                    data.Bucket(
+                        label=b.label,
+                        total_minor=round(b.total_minor * 0.41),
+                        count=b.count,
+                        key=b.key,
+                        selected=b.selected,
+                    )
+                    for b in buckets
                 ],
                 # Shares are a proportion of these items' own sum, which is what
                 # `data.top_items` computes. Inventing them independently would put

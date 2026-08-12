@@ -148,6 +148,12 @@ h2 { font-size: 11px; margin: 26px 0 10px; color: var(--muted);
 .cv { font-size: 11px; color: var(--muted); text-align: center; margin-bottom: 6px;
       font-variant-numeric: tabular-nums; white-space: nowrap; }
 .col.now .cv { color: var(--ink); font-weight: 600; }
+/* The picked month. Weight and a rule under the bar carry it as well as
+   colour, so the selection survives a colour-blind reader and a grey print. */
+.col.picked .cv { color: var(--ink); font-weight: 680; }
+.col.picked .bar { box-shadow: inset 0 0 0 2px var(--card), 0 0 0 2px var(--series); }
+.col:focus-visible { outline: 2px solid var(--series); outline-offset: 2px;
+                     border-radius: 6px; }
 .bar { background: var(--series); border-radius: 4px 4px 0 0; }
 .bar.nil { background: var(--track); border-radius: 4px; }
 .xrow { display: flex; gap: 10px; margin-top: 9px; }
@@ -299,12 +305,25 @@ def _brand(period: str) -> str:
     )
 
 
-def _tab_href(slug: str | None) -> str:
-    """Where a tab points. All is the bare route, so it is the default landing."""
-    return "/app" if slug is None else f"/app?tab={escape(slug, quote=True)}"
+def _href(*, slug: str | None = None, month: str | None = None) -> str:
+    """Where a tab or a bar points.
+
+    Both parameters travel together on every link, because they are two
+    independent choices about one view. A tab that dropped the month would
+    bounce you back to today the moment you filtered, and a bar that dropped
+    the tab would silently widen what you were looking at.
+
+    The bare route is the default landing, so today plus All stays a clean URL.
+    """
+    parts = []
+    if slug is not None:
+        parts.append(f"tab={escape(slug, quote=True)}")
+    if month is not None:
+        parts.append(f"month={escape(month, quote=True)}")
+    return "/app?" + "&amp;".join(parts) if parts else "/app"
 
 
-def _tabs(entries: list[data.Tab], active: str | None) -> str:
+def _tabs(entries: list[data.Tab], active: str | None, month: str | None = None) -> str:
     """The top nav. Brief section 2.
 
     Every tab is always present and always in the same order, including ones
@@ -321,7 +340,8 @@ def _tabs(entries: list[data.Tab], active: str | None) -> str:
         elif entry.empty:
             classes += " off"
         pills.append(
-            f'<a class="{classes}" href="{_tab_href(entry.slug)}">{escape(entry.name)}</a>'
+            f'<a class="{classes}" href="{_href(slug=entry.slug, month=month)}">'
+            f"{escape(entry.name)}</a>"
         )
     return f'<div class="tabs">{"".join(pills)}</div>'
 
@@ -412,7 +432,7 @@ def _items(slices: list[data.Slice], what: str) -> str:
     return f'<div class="card">{bars}</div>'
 
 
-def _chart(buckets: list[data.Bucket]) -> str:
+def _chart(buckets: list[data.Bucket], slug: str | None = None) -> str:
     """Six months of spend as one series in one hue.
 
     Every month is drawn even when it is empty, because a missing bar would make
@@ -435,7 +455,12 @@ def _chart(buckets: list[data.Bucket]) -> str:
 
     columns, ticks = [], []
     for index, bucket in enumerate(buckets):
-        now = " now" if index == last else ""
+        classes = "col"
+        if index == last:
+            classes += " now"
+        if bucket.selected:
+            classes += " picked"
+
         if bucket.total_minor:
             height = max(3, round(bucket.total_minor / peak * (CHART_HEIGHT - 22)))
             bar = f'<div class="bar" style="height:{height}px;--i:{index}"></div>'
@@ -447,11 +472,19 @@ def _chart(buckets: list[data.Bucket]) -> str:
             label = "&mdash;"
             tip = f"{bucket.label}: nothing recorded"
 
+        # An anchor, so the boot script's existing delegated handler navigates
+        # it exactly like a tab, and so it still works with JavaScript off, with
+        # a keyboard, and under a screen reader. `aria-current` is what carries
+        # the selection to anyone who cannot see which bar is darker.
+        chosen = ' aria-current="true"' if bucket.selected else ""
         columns.append(
-            f'<div class="col{now}" tabindex="0" data-tip="{escape(tip)}">'
-            f'<div class="cv">{label}</div>{bar}</div>'
+            f'<a class="{classes}" href="{_href(slug=slug, month=bucket.key)}"'
+            f' data-tip="{escape(tip)}"{chosen}>'
+            f'<div class="cv">{label}</div>{bar}</a>'
         )
-        ticks.append(f'<span class="{now.strip()}">{escape(bucket.label)}</span>')
+        ticks.append(
+            f'<span class="{"now" if index == last else ""}">{escape(bucket.label)}</span>'
+        )
 
     rules = (
         '<div class="rules"><i style="top:0"></i><i style="top:50%"></i>'
@@ -462,7 +495,7 @@ def _chart(buckets: list[data.Bucket]) -> str:
         f'<div class="cols">{"".join(columns)}</div></div>'
         f'<div class="xrow">{"".join(ticks)}</div>'
         f'<div class="hint">Peak month {escape(money(peak, currency))}. '
-        f"Hover a bar for the detail.</div>"
+        f"Tap a month to see it.</div>"
         f"</div>"
     )
 
@@ -553,12 +586,16 @@ def dashboard(
     active_tab: str | None = None,
     active_tab_name: str | None = None,
     extra_views: list[data.CurrencyView] | None = None,
+    month: str | None = None,
 ) -> str:
     """The whole dashboard, as one self-contained page.
 
     With `active_tab` set, every figure below the nav is scoped to that
     category, carrying its apportioned share of delivery, tax and order-level
     coupons so that the tabs add back up to the total. See `data.line_shares`.
+
+    `month` is the `YYYY-MM` currently being shown, or None for the current one.
+    It rides on every tab link so that filtering a past month keeps you there.
 
     `extra_views` holds one entry per additional currency this user has
     receipts in, each rendered as its own hero, chart and breakdown. Nothing is
@@ -596,7 +633,7 @@ def dashboard(
     others = "".join(
         f"<h2>Also spent in {escape(view.currency)}</h2>"
         f"{_hero(view.overview, scope=what if filtered else None)}"
-        f"{_chart(view.buckets)}"
+        f"{_chart(view.buckets, active_tab)}"
         f"{_items(view.slices, what) if filtered else _categories(view.slices)}"
         for view in (extra_views or [])
     )
@@ -607,11 +644,11 @@ def dashboard(
     # instead of being destroyed and rebuilt on every navigation.
     body = (
         f'<div id="chrome">{_brand(overview.period_label)}'
-        f"{_tabs(tabs or [], active_tab)}</div>"
+        f"{_tabs(tabs or [], active_tab, month)}</div>"
         f'<div id="content">'
         f"{_hero(overview, scope=what if filtered else None)}"
         "<h2>Last six months</h2>"
-        f"{_chart(buckets)}"
+        f"{_chart(buckets, active_tab)}"
         f"{breakdown}"
         f"{others}"
         f"{receipts_heading}"
