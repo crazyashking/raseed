@@ -3,7 +3,7 @@
 The output is constrained by the Pydantic contract itself rather than by asking
 for JSON in the prompt.
 
-**Passing `ExtractionResult` straight to `response_schema` does not work.** The
+**Passing `ExtractionGroup` straight to `response_schema` does not work.** The
 SDK converts `extra="forbid"` into `additional_properties`, and the Gemini API
 rejects that field outright with a 400. The conversion succeeds locally, so this
 is only visible on a live call, and it was found on the first one. See
@@ -15,7 +15,7 @@ instruction to the decoder, so the model commits to `is_receipt` before it can
 generate a line item.
 
 Dropping `additional_properties` from the wire schema does not weaken anything.
-Strictness belongs at validation, and `ExtractionResult` still rejects unknown
+Strictness belongs at validation, and `ExtractionGroup` still rejects unknown
 fields when the response is parsed.
 
 Two hardening choices come from brief section 16.10, on prompt injection through
@@ -51,7 +51,7 @@ from raseed.extraction.providers.base import (
     ProviderResult,
     ProviderTransientError,
 )
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionGroup
 
 #: Retry on these. Brief 16.5: three attempts with exponential backoff, and the
 #: image survives on disk until extraction succeeds, so nothing is lost.
@@ -104,7 +104,7 @@ def _response_schema() -> types.Schema:
     Built through the public `JSONSchema` to `Schema` conversion, which resolves
     the `$defs` and `$ref` that Pydantic emits for the nested models.
     """
-    json_schema = types.JSONSchema.model_validate(ExtractionResult.model_json_schema())
+    json_schema = types.JSONSchema.model_validate(ExtractionGroup.model_json_schema())
     return _pin_property_order(types.Schema.from_json_schema(json_schema=json_schema))
 
 
@@ -187,7 +187,7 @@ class GeminiProvider:
         return response.total_tokens
 
     def extract(self, request: ExtractionRequest) -> ProviderResult:
-        """Read the images and return a validated extraction."""
+        """Read the images and return a validated group."""
         for attempt in Retrying(
             stop=stop_after_attempt(self._max_attempts),
             wait=wait_exponential(multiplier=1, min=1, max=20),
@@ -218,11 +218,11 @@ class GeminiProvider:
             # guard and the reasoning in full.
             raise ProviderTransientError(f"could not reach gemini: {exc}") from exc
 
-        extraction, response_text = _parse(response)
+        group, response_text = _parse(response)
         input_tokens, output_tokens, thought_tokens = _usage(response)
 
         return ProviderResult(
-            extraction=extraction,
+            group=group,
             model_id=self._model_id,
             prompt_version=request.prompt_version,
             response_text=response_text,
@@ -252,8 +252,8 @@ def _translate(exc: errors.APIError) -> Exception:
     return ProviderResponseError(f"gemini returned {code}: {exc}")
 
 
-def _parse(response: Any) -> tuple[ExtractionResult, str]:
-    """Pull a validated extraction and the raw text out of a response.
+def _parse(response: Any) -> tuple[ExtractionGroup, str]:
+    """Pull a validated group and the raw text out of a response.
 
     `response.parsed` is the SDK's already-validated object. The raw text is
     kept alongside it because `raw_extractions` stores what the model actually
@@ -268,20 +268,20 @@ def _parse(response: Any) -> tuple[ExtractionResult, str]:
     text = getattr(response, "text", None) or ""
 
     parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, ExtractionResult):
+    if isinstance(parsed, ExtractionGroup):
         return parsed, text
 
     if isinstance(parsed, dict) and not text:
         # A raw Schema (rather than a Pydantic class) makes the SDK hand back a
         # plain dict. Validate it here so the contract still applies.
-        return ExtractionResult.model_validate(parsed), json.dumps(parsed)
+        return ExtractionGroup.model_validate(parsed), json.dumps(parsed)
 
     if not text:
         msg = "gemini returned neither a parsed result nor any text"
         raise ProviderResponseError(msg)
 
     try:
-        return ExtractionResult.model_validate_json(text), text
+        return ExtractionGroup.model_validate_json(text), text
     except ValueError as exc:
         msg = f"gemini returned something that is not a valid extraction: {exc}"
         raise ProviderResponseError(msg) from exc

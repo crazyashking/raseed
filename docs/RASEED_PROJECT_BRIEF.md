@@ -1504,6 +1504,12 @@ unavailable. Revised:
   "looks like a duplicate of the ₹256 order from yesterday, log anyway?" rather than silently
   rejecting. Two genuinely identical orders on the same day are possible.
 
+Amended 2026-08-12, when several images sent together became one reading. The primary key is
+the digest of the batch, in the order the images arrived, and a batch of one is its own
+digest, so nothing already in the ledger changed. A second receipt read out of the same batch
+carries a digest derived from the batch and its position, because the two would otherwise
+collide on the unique index. See the decisions log.
+
 **Date bucketing (16.2).** No printed date means `occurred_on_local` has to be inferred.
 Revised: default to the Telegram message date in the user's timezone, and store
 `date_source` as `receipt_printed` or `message_timestamp`. Anything on the second value is

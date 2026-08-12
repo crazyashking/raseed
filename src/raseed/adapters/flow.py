@@ -7,12 +7,14 @@ into messages and buttons.
 The order of the checks is the design. Cheapest and most protective first:
 
 1. **Daily cost cap.** Before anything is downloaded or paid for. Brief 16.6.
-2. **Dedupe on the image hash.** Free, and catches the common accidental resend.
+2. **Dedupe on the batch hash.** Free, and catches the common accidental resend.
    Brief 3.6 as revised by 24.4.
-3. **Extraction.** The only step that spends money.
+3. **Extraction.** The only step that spends money. One call for everything that
+   arrived together, however many receipts that turns out to be.
 4. **`is_receipt`.** Checked before a single line item is looked at, and a false
    stores nothing. Invariant 11.
 5. **The reconciliation gate.** Class 1 stores nothing; Class 2 asks the user.
+   Run per receipt, so one bad reading in a batch does not cost the others.
 6. **The user.** Nothing commits without a confirmation. Brief 3.4.
 
 Images are deleted the moment a receipt reaches a terminal state, whichever one
@@ -23,16 +25,17 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Final
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from raseed.adapters.images import ImageStore
+from raseed.adapters.images import ImageStore, batch_sha256
 from raseed.adapters.pending import PendingKey, PendingReceipt, PendingStore
 from raseed.db import ledger, queries
 from raseed.db.models import (
@@ -56,6 +59,7 @@ from raseed.extraction.providers.base import (
     ProviderResponseError,
     ProviderTransientError,
 )
+from raseed.extraction.schemas import ExtractionResult
 from raseed.money import rupees
 from raseed.timezones import zone
 from raseed.validation.reconcile import (
@@ -268,6 +272,25 @@ class FlowConfig:
     min_confidence: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _Batch:
+    """What every receipt out of one submission has in common.
+
+    Bundled rather than passed one at a time, because these eight travel
+    together to every receipt in the batch and a positional list that long is a
+    place for two of them to end up swapped.
+    """
+
+    user_id: str
+    raw_id: str
+    chat_id: int
+    message_id: int
+    paths: tuple[Path, ...]
+    message_date: dt.datetime
+    now: dt.datetime
+    total: int
+
+
 def month_start_utc(now: dt.datetime) -> dt.datetime:
     """Midnight UTC on the first of `now`'s month.
 
@@ -335,41 +358,60 @@ class ReceiptFlow:
 
     # -- submission ----------------------------------------------------------
 
-    def submit_image(
+    def submit_images(
         self,
         session: Session,
         *,
         user_id: str,
         chat_id: int,
         message_id: int,
-        data: bytes,
-        mime_type: str,
+        images: Sequence[ImagePayload],
         message_date: dt.datetime,
         source: Source = Source.TELEGRAM_IMAGE,
-    ) -> FlowResult:
-        """Run an inbound image through the pipeline up to the confirm prompt."""
+    ) -> list[FlowResult]:
+        """Run everything that arrived together through the pipeline, once.
+
+        One call, one bill, one `raw_extractions` row, and as many results as
+        there turned out to be receipts. Whether two images are two pages of one
+        bill or two separate purchases is not knowable out here, so it is not
+        guessed out here: the model says, and this fans out over the answer.
+
+        Before 2026-08-12 each image was submitted on its own. A two-image
+        receipt then produced two calls eight seconds apart, one holding four
+        items and no total and one holding a total and no items. Neither
+        reconciled, so nothing was stored, and both were paid for.
+
+        Returns one result per thing the user has to be told. A cap, a
+        duplicate, a failure or a batch of nothing but junk is a single result;
+        three receipts is three, each with its own confirm keyboard.
+        """
         now = self._clock()
+        if not images:
+            return []
 
         capped = self._check_budget(session, user_id=user_id, now=now)
         if capped is not None:
-            return capped
+            return [capped]
 
-        stored = self._images.save(data, mime_type=mime_type)
+        stored = [self._images.save(image.data, mime_type=image.mime_type) for image in images]
+        paths = tuple(item.path for item in stored)
+        batch = batch_sha256([item.sha256 for item in stored])
 
-        existing = queries.find_by_image_hash(session, user_id=user_id, image_sha256=stored.sha256)
+        existing = queries.find_by_image_hash(session, user_id=user_id, image_sha256=batch)
         if existing is not None:
-            self._images.delete(stored.path)
-            return FlowResult(
-                step=Step.DUPLICATE,
-                message=already_logged_message(existing.occurred_on_local, charged=False),
-                duplicate_of=existing,
-            )
+            self._delete_images(paths)
+            return [
+                FlowResult(
+                    step=Step.DUPLICATE,
+                    message=already_logged_message(existing.occurred_on_local, charged=False),
+                    duplicate_of=existing,
+                )
+            ]
 
-        request = ExtractionRequest(images=(ImagePayload(data=data, mime_type=mime_type),))
         try:
-            result = self._provider.extract(request)
+            result = self._provider.extract(ExtractionRequest(images=tuple(images)))
         except Exception as exc:
-            # The image stays on disk either way. Brief 16.5: the receipt must
+            # The images stay on disk either way. Brief 16.5: the receipt must
             # not be lost.
             #
             # `Exception` rather than `ProviderError`, because a provider that
@@ -382,62 +424,86 @@ class ReceiptFlow:
             # tagged with a reference. That reference is the only thing tying
             # "it did not work" from a person to the line in this log that says
             # what actually happened.
-            reference = stored.sha256[:8]
+            reference = batch[:8]
             log.warning(
                 "extraction failed, reference=%s, kind=%s",
                 reference,
                 type(exc).__name__ if isinstance(exc, ProviderError) else "outside-taxonomy",
                 exc_info=True,
             )
-            return FlowResult(
-                step=Step.EXTRACTION_FAILED,
-                message=extraction_failed_message(exc, reference),
-            )
+            return [
+                FlowResult(
+                    step=Step.EXTRACTION_FAILED,
+                    message=extraction_failed_message(exc, reference),
+                )
+            ]
 
         raw = ledger.record_extraction(
             session,
             user_id=user_id,
             result=result,
             source=source,
-            image_sha256=stored.sha256,
+            image_sha256=batch,
         )
 
-        extraction = result.extraction
+        group = result.group
 
         # Invariant 11: checked before a single line item is looked at.
-        if not extraction.is_storable:
-            self._images.delete(stored.path)
-            reason = extraction.rejection_reason or "That does not look like a receipt."
-            return FlowResult(step=Step.NOT_A_RECEIPT, message=reason)
+        if not group.is_storable:
+            self._delete_images(paths)
+            reason = group.rejection_reason or "That does not look like a receipt."
+            return [FlowResult(step=Step.NOT_A_RECEIPT, message=reason)]
 
+        batch_context = _Batch(
+            user_id=user_id,
+            raw_id=raw.id,
+            chat_id=chat_id,
+            message_id=message_id,
+            paths=paths,
+            message_date=message_date,
+            now=now,
+            total=len(group.receipts),
+        )
+        results = [
+            self._offer(session, extraction=extraction, index=index, batch=batch_context)
+            for index, extraction in enumerate(group.receipts)
+        ]
+
+        # Nothing survived the gate, so nothing will ever be confirmed and there
+        # is nothing left for the images to be needed by. Invariant 7.
+        if not any(item.step is Step.AWAITING_CONFIRMATION for item in results):
+            self._delete_images(paths)
+        return results
+
+    def _offer(
+        self, session: Session, *, extraction: ExtractionResult, index: int, batch: _Batch
+    ) -> FlowResult:
+        """Put one receipt of a batch in front of the user, or refuse it."""
         verdict = reconcile(
             extraction,
             tolerance_minor=self._config.tolerance_minor,
             min_confidence=self._config.min_confidence,
         )
-        mrp = cross_check_mrp(extraction, tolerance_minor=self._config.tolerance_minor)
-
         if verdict.outcome is Outcome.CLASS_1:
-            self._images.delete(stored.path)
             return FlowResult(step=Step.REJECTED, message=verdict.reason)
 
         printed = parse_printed_date(
             extraction.order_datetime_local, fallback_tz=self._config.default_timezone
         )
-        occurred_on_local = (
-            printed or message_date.astimezone(zone(self._config.default_timezone)).date()
-        )
-
         receipt = PendingReceipt(
-            key=PendingKey(chat_id=chat_id, message_id=message_id),
-            user_id=user_id,
-            raw_extraction_id=raw.id,
+            key=PendingKey(chat_id=batch.chat_id, message_id=batch.message_id, part=index),
+            user_id=batch.user_id,
+            raw_extraction_id=batch.raw_id,
             extraction=extraction,
             reconciliation=verdict,
-            mrp=mrp,
-            occurred_on_local=occurred_on_local,
-            created_at=now,
-            image_path=stored.path,
+            mrp=cross_check_mrp(extraction, tolerance_minor=self._config.tolerance_minor),
+            occurred_on_local=(
+                printed or batch.message_date.astimezone(zone(self._config.default_timezone)).date()
+            ),
+            created_at=batch.now,
+            receipt_index=index,
+            receipt_count=batch.total,
+            image_paths=batch.paths,
             # Decided here, where `printed` is already known, and carried to
             # confirm. It used to be left at its default and re-derived later,
             # which meant `pending_receipts.date_source` said RECEIPT_PRINTED on
@@ -447,12 +513,16 @@ class ReceiptFlow:
             date_source=(DateSource.RECEIPT_PRINTED if printed else DateSource.MESSAGE_TIMESTAMP),
         )
         self._pending.put(session, receipt)
-
         return FlowResult(
             step=Step.AWAITING_CONFIRMATION,
             message=summarise(receipt),
             pending=receipt,
         )
+
+    def _delete_images(self, paths: Sequence[Path]) -> None:
+        """Invariant 7, over however many images the receipt arrived on."""
+        for path in paths:
+            self._images.delete(path)
 
     def _over_budget(self, session: Session, *, user_id: str, now: dt.datetime) -> bool:
         """Whether any of the three API budgets is already spent. Brief 16.6."""
@@ -604,11 +674,16 @@ class ReceiptFlow:
         # the plain fact that it is already logged.
         if raw.image_sha256:
             already = queries.find_by_image_hash(
-                session, user_id=receipt.user_id, image_sha256=raw.image_sha256
+                session,
+                user_id=receipt.user_id,
+                # The batch's digest belongs to its first receipt. Asking with it
+                # on behalf of the second would find the first and report a
+                # duplicate that is a different purchase.
+                image_sha256=ledger.receipt_sha256(raw.image_sha256, receipt.receipt_index),
             )
             if already is not None:
                 self._pending.pop(session, key, now=now)
-                self._images.delete(receipt.image_path)
+                self._delete_images(receipt.image_paths)
                 return FlowResult(
                     step=Step.DUPLICATE,
                     message=already_logged_message(already.occurred_on_local, charged=True),
@@ -642,6 +717,7 @@ class ReceiptFlow:
                 reconciliation=receipt.reconciliation,
                 occurred_on_local=receipt.occurred_on_local,
                 date_source=receipt.date_source,
+                receipt_index=receipt.receipt_index,
                 merchant=merchant,
                 enrichment=stage2,
             )
@@ -655,7 +731,7 @@ class ReceiptFlow:
             session.rollback()
             log.exception("confirm hit the duplicate index for %s", key)
             self._pending.pop(session, key, now=now)
-            self._images.delete(receipt.image_path)
+            self._delete_images(receipt.image_paths)
             return FlowResult(
                 step=Step.DUPLICATE,
                 message=(
@@ -666,7 +742,7 @@ class ReceiptFlow:
 
         # Only now. Everything above can fail and leave the button usable.
         self._pending.pop(session, key, now=now)
-        self._images.delete(receipt.image_path)
+        self._delete_images(receipt.image_paths)
         return FlowResult(
             step=Step.STORED,
             message=f"Logged {rupees(transaction.grand_total_minor)}.",
@@ -678,7 +754,7 @@ class ReceiptFlow:
         receipt = self._pending.pop(session, key, now=self._clock())
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
-        self._images.delete(receipt.image_path)
+        self._delete_images(receipt.image_paths)
         return FlowResult(step=Step.DISCARDED, message="Discarded. Nothing was saved.")
 
     def accept_gap(self, session: Session, key: PendingKey) -> FlowResult:
@@ -752,7 +828,7 @@ class ReceiptFlow:
         """Drop timed-out receipts and delete their images. Invariant 7."""
         dead = self._pending.expire(session, now=self._clock())
         for receipt in dead:
-            self._images.delete(receipt.image_path)
+            self._delete_images(receipt.image_paths)
         return dead
 
 
@@ -764,7 +840,13 @@ class ReceiptFlow:
 def summarise(receipt: PendingReceipt) -> str:
     """The parsed summary the user confirms against. Brief 3.4."""
     extraction = receipt.extraction
-    lines = [f"{receipt.occurred_on_local.isoformat()}"]
+    lines: list[str] = []
+    if receipt.receipt_count > 1:
+        # Several confirm prompts arriving at once are otherwise indistinguishable
+        # from the bot having read the same receipt twice, which is exactly the
+        # thing it is being asked to prove it did not do.
+        lines.append(f"Receipt {receipt.receipt_index + 1} of {receipt.receipt_count}")
+    lines.append(f"{receipt.occurred_on_local.isoformat()}")
 
     if receipt.merchant_slug:
         lines.append(receipt.merchant_slug.replace("-", " ").title())

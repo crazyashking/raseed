@@ -14,9 +14,11 @@ from conftest import as_extraction_payload, load_fixture
 from raseed.extraction.schemas import (
     Charge,
     Discount,
+    ExtractionGroup,
     ExtractionResult,
     LineItem,
     Tax,
+    group_from_json,
 )
 
 ALL_MODELS: tuple[type[BaseModel], ...] = (ExtractionResult, LineItem, Charge, Tax, Discount)
@@ -274,3 +276,103 @@ def test_printed_product_discount_defaults_to_null() -> None:
     """The fixtures do not print one. The 24.3 cross-check has to cope with that."""
     result = ExtractionResult.model_validate(as_extraction_payload("blinkit_026"))
     assert result.printed_product_discount_minor is None
+
+
+# ---------------------------------------------------------------------------
+# The group wrapper (2026-08-12)
+# ---------------------------------------------------------------------------
+
+
+def a_receipt(name: str = "blinkit_001") -> ExtractionResult:
+    return ExtractionResult.model_validate(as_extraction_payload(name))
+
+
+def test_every_fixture_still_validates_on_its_own(fixture_name: str) -> None:
+    """The wrapper is a wrapper. `ExtractionResult` did not change shape.
+
+    Thirty-two eval fixtures describe one receipt each and are scored field by
+    field against what the model returns. A wrapper that altered the inner
+    schema would have quietly invalidated all of them.
+    """
+    assert a_receipt(fixture_name).is_receipt is True
+
+
+def test_a_group_carries_as_many_receipts_as_it_counted() -> None:
+    group = ExtractionGroup.of(a_receipt("blinkit_001"), a_receipt("blinkit_026"), images=2)
+    assert group.receipt_count == 2
+    assert group.image_count == 2
+    assert group.is_storable is True
+
+
+def test_a_count_that_disagrees_with_the_list_is_rejected() -> None:
+    """The count is generated before the receipts, so it is exactly the field a
+    model can contradict two hundred tokens later."""
+    with pytest.raises(ValidationError, match="receipt_count is 2 but 1 were returned"):
+        ExtractionGroup.model_validate(
+            {
+                "image_count": 2,
+                "receipt_count": 2,
+                "receipts": [as_extraction_payload("blinkit_001")],
+            }
+        )
+
+
+def test_finding_nothing_has_to_say_what_it_saw() -> None:
+    with pytest.raises(ValidationError, match="rejection_reason is required"):
+        ExtractionGroup.model_validate({"image_count": 1, "receipt_count": 0, "receipts": []})
+
+
+def test_finding_something_may_not_also_reject() -> None:
+    with pytest.raises(ValidationError, match="rejection_reason must be null"):
+        ExtractionGroup.model_validate(
+            {
+                "image_count": 1,
+                "receipt_count": 1,
+                "rejection_reason": "a cat",
+                "receipts": [as_extraction_payload("blinkit_001")],
+            }
+        )
+
+
+def test_a_listed_receipt_has_to_be_one() -> None:
+    """Invariant 11 at the group level: what is not a receipt is not listed."""
+    with pytest.raises(ValidationError, match="a listed receipt must have is_receipt true"):
+        ExtractionGroup.model_validate(
+            {
+                "image_count": 1,
+                "receipt_count": 1,
+                "receipts": [
+                    {"is_receipt": False, "receipt_confidence": 0.1, "rejection_reason": "a menu"}
+                ],
+            }
+        )
+
+
+def test_a_group_needs_at_least_one_image() -> None:
+    with pytest.raises(ValidationError):
+        ExtractionGroup.model_validate(
+            {"image_count": 0, "receipt_count": 0, "rejection_reason": "nothing", "receipts": []}
+        )
+
+
+def test_a_row_written_before_the_wrapper_still_reads_back() -> None:
+    """`raw_extractions` is immutable (invariant 5), so v1 rows are permanent."""
+    group = group_from_json(a_receipt("blinkit_026").model_dump_json())
+    assert group.receipt_count == 1
+    assert group.receipts[0] == a_receipt("blinkit_026")
+
+
+def test_a_v1_row_that_was_not_a_receipt_still_reads_back() -> None:
+    junk = ExtractionResult(is_receipt=False, receipt_confidence=0.1, rejection_reason="a menu")
+    group = group_from_json(junk.model_dump_json())
+    assert group.is_storable is False
+    assert group.rejection_reason == "a menu"
+
+
+def test_the_two_stored_shapes_cannot_be_confused() -> None:
+    """Both forbid unknown fields and neither one's required fields are in the
+    other, so a v1 row cannot validate as a group by accident."""
+    with pytest.raises(ValidationError):
+        ExtractionGroup.model_validate(as_extraction_payload("blinkit_001"))
+    with pytest.raises(ValidationError):
+        ExtractionResult.model_validate(ExtractionGroup.of(a_receipt()).model_dump(mode="json"))

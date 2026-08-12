@@ -47,7 +47,7 @@ from raseed.db.models import (
 )
 from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ProviderResult
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 from raseed.identity import user_id_for
 from raseed.money import apportion, compact, money, rupees
 from raseed.validation.reconcile import reconcile
@@ -91,7 +91,7 @@ def store(
         session,
         user_id=user.id,
         result=ProviderResult(
-            extraction=extraction,
+            group=ExtractionGroup.of(extraction),
             model_id="gemini-3.6-flash",
             prompt_version="v1",
             response_text=extraction.model_dump_json(),

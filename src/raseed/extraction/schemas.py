@@ -29,7 +29,15 @@ from __future__ import annotations
 
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 #: A money amount in minor units (paise), always non-negative.
 #:
@@ -243,13 +251,134 @@ class ExtractionResult(_Frozen):
         return self.is_receipt
 
 
+class ExtractionGroup(_Frozen):
+    """Everything Stage 1 returns for one batch of images.
+
+    A person sending a long receipt sends two photographs of it. A person
+    catching up on a week of receipts sends five photographs of five different
+    ones. Both arrive as the same thing: several images in one message. Nothing
+    outside the images says which case it is, so the model has to say, and this
+    is where it says it.
+
+    Live on 2026-08-10, before this existed, a two-image receipt produced two
+    separate single-image calls eight seconds apart: one with four items and no
+    total, one with no items and a total of ₹258. Neither reconciled, nothing
+    was stored, and both were paid for.
+
+    `ExtractionResult` is untouched by this wrapper. It is what one receipt
+    looks like whether it took one image or three, which is what keeps the eval
+    fixtures meaningful.
+
+    Do not reorder the fields. The counts come before the receipts so the model
+    commits to how many there are before it generates the first one. Brief 21.2.
+    """
+
+    image_count: StrictInt = Field(
+        ge=1,
+        description=(
+            "How many images you were given. Count them. This is a check that "
+            "you looked at all of them, not just the last one."
+        ),
+    )
+    receipt_count: StrictInt = Field(
+        ge=0,
+        description=(
+            "How many DISTINCT receipts these images show. Several images of one "
+            "long receipt are ONE receipt, not one per image. Images of different "
+            "purchases are one receipt each. An image that is not a receipt at "
+            "all counts as none."
+        ),
+    )
+    rejection_reason: str | None = Field(
+        default=None,
+        description=(
+            "Required when receipt_count is 0: one short sentence on what the "
+            "images actually show. Must be null when there is at least one receipt."
+        ),
+    )
+    receipts: list[ExtractionResult] = Field(
+        default_factory=list,
+        description=(
+            "One entry per distinct receipt, in the order the images were given. "
+            "A receipt spread over several images is a single entry holding every "
+            "line item from every one of those images."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _counts_match_the_receipts(self) -> Self:
+        """The count is the commitment; the list is the work. They have to agree.
+
+        Checked rather than trusted, because the count is generated first and is
+        exactly the kind of field a model can contradict two hundred tokens
+        later. A group that disagrees with itself is rejected at the boundary
+        instead of storing whichever half happened to be right.
+        """
+        if len(self.receipts) != self.receipt_count:
+            msg = f"receipt_count is {self.receipt_count} but {len(self.receipts)} were returned"
+            raise ValueError(msg)
+        if self.receipt_count == 0 and not (self.rejection_reason or "").strip():
+            msg = "rejection_reason is required when no receipt was found"
+            raise ValueError(msg)
+        if self.receipt_count and self.rejection_reason is not None:
+            msg = "rejection_reason must be null when a receipt was found"
+            raise ValueError(msg)
+        if any(not receipt.is_receipt for receipt in self.receipts):
+            msg = (
+                "a listed receipt must have is_receipt true; an image that is not one is not listed"
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def is_storable(self) -> bool:
+        """Whether anything here may be persisted at all. Invariant 11."""
+        return bool(self.receipts)
+
+    @classmethod
+    def of(cls, *results: ExtractionResult, images: int = 1) -> ExtractionGroup:
+        """Wrap loose results, for tests and for reading back a v1 row.
+
+        Rows written before 2026-08-12 hold a bare `ExtractionResult`, and they
+        are immutable under invariant 5, so nothing rewrites them. They are read
+        back through here instead.
+        """
+        keep = [result for result in results if result.is_receipt]
+        rejected = next((r.rejection_reason for r in results if not r.is_receipt), None)
+        return cls(
+            image_count=images,
+            receipt_count=len(keep),
+            rejection_reason=None if keep else (rejected or "No receipt was found."),
+            receipts=keep,
+        )
+
+
+def group_from_json(text: str) -> ExtractionGroup:
+    """Read a stored response, whichever of the two shapes it was written in.
+
+    `raw_extractions` is immutable (invariant 5), so the rows written before
+    2026-08-12 still hold a bare `ExtractionResult` and always will. Reading
+    them has to keep working, and nothing rewrites them to make it easier.
+
+    The two shapes cannot be confused for each other. Both forbid unknown
+    fields, and neither one's required fields appear in the other, so a v1 row
+    fails group validation outright rather than validating into something wrong.
+    """
+    try:
+        return ExtractionGroup.model_validate_json(text)
+    except ValidationError:
+        return ExtractionGroup.of(ExtractionResult.model_validate_json(text))
+
+
 __all__ = [
     "Charge",
     "CurrencyCode",
     "Discount",
+    "ExtractionGroup",
     "ExtractionResult",
     "LineItem",
     "MinorAmount",
     "PrintedText",
     "Tax",
+    "group_from_json",
 ]

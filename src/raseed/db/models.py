@@ -343,8 +343,23 @@ class PendingReceiptRow(Base):
         Enum(DateSource, native_enum=False), nullable=False
     )
 
+    #: Which receipt of the batch this row is, counting from zero.
+    #:
+    #: One call over several images can return several receipts, and they all
+    #: point at the same immutable `raw_extractions` row. This is what says
+    #: which one to read back out of it.
+    receipt_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
     #: Deleted on confirm or discard. Invariant 7. Null for text entry.
-    image_path: Mapped[str | None] = mapped_column(String(500))
+    #:
+    #: A JSON array, because a receipt too long for one photograph arrives as
+    #: several and every one of them has to be deleted. Held per pending receipt
+    #: rather than per batch: deleting is idempotent, so two receipts out of one
+    #: batch both listing the same files costs nothing and leaves nothing behind
+    #: if only one of them is ever answered.
+    image_paths: Mapped[str | None] = mapped_column(String(2000))
 
     #: Choices the user already made, which a restart must not throw away.
     merchant_slug: Mapped[str | None] = mapped_column(String(80))
@@ -413,7 +428,18 @@ class Transaction(Base):
     source: Mapped[Source] = mapped_column(Enum(Source, native_enum=False), nullable=False)
 
     #: Repeated from the extraction so dedupe does not need a join.
+    #:
+    #: The batch's own digest for the first receipt read out of it, and a digest
+    #: derived from the batch and the position for every one after. The unique
+    #: index above is why: two receipts out of one batch would otherwise collide
+    #: on it. See `adapters.images.receipt_sha256`.
     image_sha256: Mapped[str | None] = mapped_column(String(64))
+
+    #: Which receipt of the batch this is, counting from zero. Zero for every
+    #: row written before 2026-08-12, and for every batch holding one receipt.
+    receipt_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     #: Printed on the receipt, if it printed one. Not a natural key on its own.
     order_id: Mapped[str | None] = mapped_column(String(120))

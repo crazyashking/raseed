@@ -6,9 +6,10 @@ file rather than a refactor (brief section 4.5), and it is what lets the whole
 pipeline be tested without a network.
 
 The interface is deliberately narrow. A provider takes images and returns a
-validated `ExtractionResult` plus what the call cost. It does not reconcile, does
+validated `ExtractionGroup` plus what the call cost. It does not reconcile, does
 not store, does not categorize, and does not decide whether the result is good
-enough to keep.
+enough to keep. It does decide how many receipts the images show, because only
+something that has looked at the images can.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction import prompts
+from raseed.extraction.schemas import ExtractionGroup
 
 
 class ProviderError(RuntimeError):
@@ -69,10 +71,15 @@ class ImagePayload:
 
 @dataclass(frozen=True, slots=True)
 class ExtractionRequest:
-    """One receipt, which may be several images if it came from a PDF."""
+    """One batch of images, which may hold one receipt, several, or none.
+
+    Whether two images are two pages or two purchases is not knowable from
+    outside the images, so this does not try to decide. It hands over what
+    arrived together and the answer comes back as an `ExtractionGroup`.
+    """
 
     images: tuple[ImagePayload, ...]
-    prompt_version: str = "v1"
+    prompt_version: str = prompts.DEFAULT_VERSION
 
     def __post_init__(self) -> None:
         if not self.images:
@@ -87,9 +94,13 @@ class ProviderResult:
     `response_text` is the provider's raw output, stored verbatim in
     `raw_extractions.response_json`. Keeping the unparsed text means a future
     schema change in this repo cannot invalidate history. Invariant 5.
+
+    One result per call, however many receipts the call found. The cost is the
+    call's, so splitting it across receipts would either double-count it or
+    invent a division that the invoice does not make.
     """
 
-    extraction: ExtractionResult
+    group: ExtractionGroup
     model_id: str
     prompt_version: str
     response_text: str
@@ -127,7 +138,7 @@ class ExtractionProvider(Protocol):
         ...
 
     def extract(self, request: ExtractionRequest) -> ProviderResult:
-        """Read the images and return a validated extraction.
+        """Read the images and return a validated group.
 
         Raises:
             ProviderTransientError: Retryable. Rate limit, timeout, 5xx.

@@ -17,7 +17,12 @@ from pathlib import Path
 PROMPT_DIR = Path(__file__).parent
 
 #: What a provider uses when nothing else is specified.
-DEFAULT_VERSION = "v1"
+#:
+#: v2 since 2026-08-12, when the response schema became `ExtractionGroup`. v1
+#: describes a single `ExtractionResult` and does not match that schema, so the
+#: two moved together. v1 stays on disk because rows in `raw_extractions`
+#: reference it and that reference has to keep meaning what it meant.
+DEFAULT_VERSION = "v2"
 
 
 class PromptNotFoundError(LookupError):

@@ -9,8 +9,12 @@ Three things here are load-bearing:
 - **Access control is a whitelist, and an empty whitelist admits nobody.** An
   unlisted sender gets no reply at all, not even a refusal, because replying
   confirms the bot exists to whoever is probing it.
-- **Callback data carries `(chat_id, message_id)`**, so three receipts sent in a
-  row cannot confuse their confirm buttons. Brief 16.4.
+- **Callback data carries `(chat_id, message_id, part)`**, so three receipts
+  sent in a row cannot confuse their confirm buttons, and neither can three read
+  out of one album. Brief 16.4.
+- **An album is buffered before it is read.** Telegram delivers each photograph
+  of one as its own update and never says how many are coming, so `_ingest`
+  holds them for a moment and submits them together.
 - **The bot never tells you how to send a receipt.** Invariant 10. It may say it
   could not read one, which is a different statement, and it never suggests
   cropping, retaking as a file, rotating or resending differently.
@@ -18,10 +22,11 @@ Three things here are load-bearing:
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import datetime as dt
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Final
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -50,6 +55,7 @@ from raseed.adapters.pending import PendingKey, PendingReceipt
 from raseed.db import ledger, queries
 from raseed.db.models import User
 from raseed.db.seed import bootstrap
+from raseed.extraction.providers.base import ImagePayload
 from raseed.identity import user_id_for
 from raseed.validation.reconcile import Outcome
 
@@ -86,6 +92,16 @@ FORWARD: Final[str] = "\N{BLACK RIGHT-POINTING TRIANGLE}"
 
 #: A button this bot did not draw, or one whose payload arrived malformed.
 UNKNOWN_BUTTON_MESSAGE: Final[str] = "I do not know what that button does."
+
+#: How long an album is held open before it is read.
+#:
+#: Telegram delivers each photograph of an album as its own update sharing a
+#: `media_group_id`, with no count and nothing marking the last one. The only
+#: signal that one is complete is that nothing more has arrived, so this is the
+#: length of that silence. Two seconds is comfortably longer than the gap
+#: between updates of one album and short enough that a person watching the
+#: chat does not think the bot missed them.
+ALBUM_WAIT_SECONDS: Final[float] = 2.0
 
 #: Telegram compresses `message.photo` and caps the long edge. A document keeps
 #: the original bytes. Both are accepted and the user is never told which is
@@ -271,6 +287,10 @@ class RaseedBot:
         public_url: The public HTTPS address. Its presence is what turns
             `/dashboard` into a Mini App button, which is the only form that
             carries the signed `initData` the dashboard authenticates with.
+        album_wait: Seconds to hold an album open. Telegram sends each
+            photograph of one as its own update and never says how many are
+            coming, so the end of an album is only visible as a pause. Lowered
+            in tests, which have no network between them and the images.
     """
 
     def __init__(
@@ -283,6 +303,7 @@ class RaseedBot:
         user_id_secret: str,
         dashboard_url: str | None = None,
         public_url: str = "",
+        album_wait: float = ALBUM_WAIT_SECONDS,
     ) -> None:
         self._flow = flow
         self._sessions = session_factory
@@ -291,6 +312,12 @@ class RaseedBot:
         self._secret = user_id_secret
         self._dashboard_url = dashboard_url
         self._public_url = public_url
+        self._album_wait = album_wait
+        #: Images of an album that arrived while its window is still open. In
+        #: memory and deliberately so: it holds a receipt for a second or two,
+        #: and a restart inside that window loses an image nobody has been
+        #: billed for yet.
+        self._albums: dict[str, list[tuple[int, ImagePayload]]] = {}
 
     # -- access control ------------------------------------------------------
 
@@ -354,27 +381,82 @@ class RaseedBot:
         await self._ingest(update, data=data, mime_type=document.mime_type or PHOTO_MIME)
 
     async def _ingest(self, update: Update, *, data: bytes, mime_type: str) -> None:
+        """Take one inbound image, alone or as part of an album.
+
+        Telegram does not deliver an album. It delivers each photograph as its
+        own update carrying a shared `media_group_id`, with no count and no
+        marker on the last one, so the only way to know an album is complete is
+        that nothing more has arrived for a moment. That is what `_gather` does.
+        """
         message = update.message
-        user = update.effective_user
-        if message is None or user is None:
+        if message is None or update.effective_user is None:
+            return
+
+        payload = ImagePayload(data=data, mime_type=mime_type)
+        album = message.media_group_id
+        if album is None:
+            await self._submit(update, [payload])
+            return
+
+        pending = self._albums.setdefault(album, [])
+        pending.append((message.message_id, payload))
+        if len(pending) > 1:
+            # A later image of an album already being waited on. The first one's
+            # task will pick this up.
+            return
+
+        await self._gather(update, album)
+
+    async def _gather(self, update: Update, album: str) -> None:
+        """Wait for the rest of an album, then submit all of it as one batch.
+
+        The wait is a plain sleep rather than a scheduled job, because the job
+        queue is an optional dependency and invariant 12 does not permit
+        installing one to avoid three lines.
+
+        Anything still arriving after the window is its own batch and gets its
+        own answer, which is the honest failure: a receipt read twice is a
+        confirm prompt the user can discard, and a receipt never read is money
+        already spent for nothing.
+        """
+        await asyncio.sleep(self._album_wait)
+        collected = self._albums.pop(album, [])
+        if not collected:  # pragma: no cover - only reachable if two tasks race
+            return
+        collected.sort()
+        await self._submit(
+            update, [payload for _, payload in collected], message_id=collected[0][0]
+        )
+
+    async def _submit(
+        self, update: Update, images: Sequence[ImagePayload], *, message_id: int | None = None
+    ) -> None:
+        message = update.message
+        if message is None:
             return
 
         with self._sessions() as session:
             owner = self.owner(session, update)
             if owner is None:
                 return
-            result = self._flow.submit_image(
+            results = self._flow.submit_images(
                 session,
                 user_id=owner.id,
                 chat_id=message.chat_id,
-                message_id=message.message_id,
-                data=data,
-                mime_type=mime_type,
+                # The first image of an album, so every receipt out of it hangs
+                # off one message and the parts are told apart by `part`.
+                message_id=message_id if message_id is not None else message.message_id,
+                images=images,
                 message_date=message.date,
             )
-            log.info("receipt -> %s", result.step.value)
+            log.info(
+                "%d image(s) -> %s",
+                len(images),
+                ", ".join(result.step.value for result in results) or "nothing",
+            )
             session.commit()
-            await self._reply(update, result, session=session, user_id=owner.id)
+            for result in results:
+                await self._reply(update, result, session=session, user_id=owner.id)
 
     async def on_button(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         """Every inline keyboard press lands here."""

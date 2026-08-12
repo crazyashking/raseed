@@ -38,7 +38,7 @@ from raseed.extraction.providers.gemini import (
     _translate,
     _usage,
 )
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
 
@@ -53,6 +53,10 @@ def a_request(count: int = 1) -> ExtractionRequest:
 
 def an_extraction(name: str = "blinkit_001") -> ExtractionResult:
     return ExtractionResult.model_validate(as_extraction_payload(name))
+
+
+def a_group(name: str = "blinkit_001", *, images: int = 1) -> ExtractionGroup:
+    return ExtractionGroup.of(an_extraction(name), images=images)
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +130,29 @@ def test_format_usd(micros: int, rendered: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v1_exists_and_is_the_default() -> None:
-    assert prompts.DEFAULT_VERSION == "v1"
-    assert "v1" in prompts.available()
-    assert prompts.load().startswith("# Extraction prompt v1")
+def test_v2_is_the_default_and_v1_is_still_readable() -> None:
+    """v1 is not deleted when it stops being the default.
+
+    Rows in `raw_extractions` name the prompt that produced them and are
+    immutable, so a version that goes away takes the meaning of those rows with
+    it. Invariant 5.
+    """
+    assert prompts.DEFAULT_VERSION == "v2"
+    assert prompts.available() == ("v1", "v2")
+    assert prompts.load().startswith("# Extraction prompt v2")
+    assert prompts.load("v1").startswith("# Extraction prompt v1")
+
+
+@pytest.mark.parametrize("phrase", ["one receipt", "count them", "distinct receipts"])
+def test_the_prompt_asks_how_many_receipts_there_are(phrase: str) -> None:
+    """The whole reason v2 exists. A batch is grouped by the only thing that saw it."""
+    assert phrase in " ".join(prompts.load().lower().split())
 
 
 def test_the_prompt_states_the_rules_that_matter() -> None:
     """A prompt that loses these is a regression, whatever the eval says."""
     # Collapsed, because these phrases wrap across lines in the source file.
-    text = " ".join(prompts.load("v1").lower().split())
+    text = " ".join(prompts.load().lower().split())
     assert "struck-through" in text
     assert "order-level" in text
     assert "paise" in text
@@ -190,7 +207,7 @@ class FakeResponse:
     def __init__(
         self,
         *,
-        parsed: ExtractionResult | None = None,
+        parsed: ExtractionGroup | None = None,
         text: str = "",
         usage: FakeUsage | None = None,
         prompt_feedback: Any = None,
@@ -246,13 +263,13 @@ def api_error(code: int) -> errors.APIError:
 
 
 def test_a_successful_extraction_round_trips() -> None:
-    extraction = an_extraction()
-    p = provider([FakeResponse(parsed=extraction, text=extraction.model_dump_json())])
+    group = a_group()
+    p = provider([FakeResponse(parsed=group, text=group.model_dump_json())])
     result = p.extract(a_request())
 
-    assert result.extraction == extraction
+    assert result.group == group
     assert result.model_id == "gemini-3.6-flash"
-    assert result.prompt_version == "v1"
+    assert result.prompt_version == "v2"
     assert result.input_tokens == 3022
     assert result.output_tokens == 450
     assert result.cost_micros_usd == cost_micros(
@@ -262,24 +279,22 @@ def test_a_successful_extraction_round_trips() -> None:
 
 def test_the_raw_response_text_is_kept_verbatim() -> None:
     """`raw_extractions` stores what the model said, not our reading of it."""
-    extraction = an_extraction()
-    raw = extraction.model_dump_json()
-    p = provider([FakeResponse(parsed=extraction, text=raw)])
+    group = a_group()
+    raw = group.model_dump_json()
+    p = provider([FakeResponse(parsed=group, text=raw)])
     assert p.extract(a_request()).response_text == raw
 
 
 def test_the_call_carries_no_tools() -> None:
     """Brief 16.10. Nothing the model emits can trigger an action."""
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     config = client.models.calls[0]["config"]
     assert config.tools is None
 
 
 def test_the_system_instruction_says_image_content_is_data() -> None:
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     config = client.models.calls[0]["config"]
     assert config.system_instruction == SYSTEM_INSTRUCTION
@@ -287,16 +302,14 @@ def test_the_system_instruction_says_image_content_is_data() -> None:
 
 
 def test_decoding_is_deterministic_by_default() -> None:
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     assert client.models.calls[0]["config"].temperature == 0.0
 
 
 def test_the_schema_constrains_the_output() -> None:
     """Provider-native constrained decoding, not a prompt asking for JSON."""
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     config = client.models.calls[0]["config"]
     assert config.response_mime_type == "application/json"
@@ -323,17 +336,35 @@ def test_the_wire_schema_carries_no_additional_properties() -> None:
     walk(schema)
 
 
+def receipt_schema() -> Any:
+    """The `ExtractionResult` inside the group's `receipts` array."""
+    receipts = (_response_schema().properties or {})["receipts"].items
+    assert receipts is not None
+    return receipts
+
+
 def test_the_wire_schema_pins_field_order_everywhere() -> None:
     """Brief 21.2 is only real if the decoder is told the order."""
-    schema = _response_schema()
-    assert schema.property_ordering is not None
-    assert schema.property_ordering[:3] == [
+    group = _response_schema()
+    assert group.property_ordering is not None
+    # The counts before the receipts, so the model commits to how many there
+    # are before it generates the first one.
+    assert group.property_ordering == [
+        "image_count",
+        "receipt_count",
+        "rejection_reason",
+        "receipts",
+    ]
+
+    receipt = receipt_schema()
+    assert receipt.property_ordering is not None
+    assert receipt.property_ordering[:3] == [
         "is_receipt",
         "receipt_confidence",
         "rejection_reason",
     ]
 
-    line_items = (schema.properties or {})["line_items"].items
+    line_items = (receipt.properties or {})["line_items"].items
     assert line_items is not None
     assert line_items.property_ordering is not None
     assert line_items.property_ordering.index("mrp_minor") < line_items.property_ordering.index(
@@ -343,7 +374,7 @@ def test_the_wire_schema_pins_field_order_everywhere() -> None:
 
 def test_the_wire_schema_resolved_the_nested_models() -> None:
     """Pydantic emits $defs and $ref. An unresolved ref would decode to nothing."""
-    line_items = (_response_schema().properties or {})["line_items"].items
+    line_items = (receipt_schema().properties or {})["line_items"].items
     assert line_items is not None
     assert set(line_items.properties or {}) == {
         "raw_name",
@@ -362,8 +393,7 @@ def test_strictness_still_applies_when_the_response_is_validated() -> None:
 
 
 def test_the_prompt_comes_before_the_images() -> None:
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request(count=3))
     parts = client.models.calls[0]["contents"].parts
     assert len(parts) == 4
@@ -373,8 +403,7 @@ def test_the_prompt_comes_before_the_images() -> None:
 
 def test_every_page_of_a_multi_image_request_is_sent() -> None:
     """A multi-page PDF is one receipt, per the proposed section 3.10."""
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request(count=5))
     assert len(client.models.calls[0]["contents"].parts) == 6
 
@@ -385,9 +414,8 @@ def test_every_page_of_a_multi_image_request_is_sent() -> None:
 
 
 def test_thinking_tokens_are_billed_as_output_and_reported_separately() -> None:
-    extraction = an_extraction()
     p = provider(
-        [FakeResponse(parsed=extraction, text="{}", usage=FakeUsage(3022, 450, thoughts=1200))]
+        [FakeResponse(parsed=a_group(), text="{}", usage=FakeUsage(3022, 450, thoughts=1200))]
     )
     result = p.extract(a_request())
     assert result.output_tokens == 1650
@@ -425,10 +453,9 @@ def test_a_count_with_no_total_is_an_error() -> None:
 
 @pytest.mark.parametrize("code", [429, 500, 502, 503, 504])
 def test_transient_failures_are_retried(code: int) -> None:
-    extraction = an_extraction()
-    client = FakeClient([api_error(code), FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([api_error(code), FakeResponse(parsed=a_group(), text="{}")])
     result = GeminiProvider(client=as_client(client), max_attempts=3).extract(a_request())
-    assert result.extraction == extraction
+    assert result.group == a_group()
     assert len(client.models.calls) == 2
 
 
@@ -455,12 +482,11 @@ def test_a_dropped_connection_is_transient_and_retried() -> None:
     outright: no retry, and a raw transport exception delivered to a caller that
     was only ever told to expect `ProviderError`.
     """
-    extraction = an_extraction()
     client = FakeClient(
-        [OSError("[Errno 11001] getaddrinfo failed"), FakeResponse(parsed=extraction, text="{}")]
+        [OSError("[Errno 11001] getaddrinfo failed"), FakeResponse(parsed=a_group(), text="{}")]
     )
     result = GeminiProvider(client=as_client(client), max_attempts=3).extract(a_request())
-    assert result.extraction == extraction
+    assert result.group == a_group()
     assert len(client.models.calls) == 2
 
 
@@ -490,9 +516,9 @@ def test_an_empty_response_is_an_error() -> None:
 
 def test_a_response_that_is_only_text_is_still_validated() -> None:
     """Falls back to parsing the text when the SDK did not parse it for us."""
-    extraction = an_extraction("blinkit_026")
-    p = provider([FakeResponse(parsed=None, text=extraction.model_dump_json())])
-    assert p.extract(a_request()).extraction == extraction
+    group = a_group("blinkit_026")
+    p = provider([FakeResponse(parsed=None, text=group.model_dump_json())])
+    assert p.extract(a_request()).group == group
 
 
 # ---------------------------------------------------------------------------
@@ -512,12 +538,11 @@ def test_the_model_id_is_reported_for_the_audit_trail() -> None:
 
 def test_media_resolution_is_off_unless_asked_for() -> None:
     """Brief section 3.11, on tiling tall receipts, does not exist yet."""
-    extraction = an_extraction()
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(client=as_client(client)).extract(a_request())
     assert client.models.calls[0]["config"].media_resolution is None
 
-    client = FakeClient([FakeResponse(parsed=extraction, text="{}")])
+    client = FakeClient([FakeResponse(parsed=a_group(), text="{}")])
     GeminiProvider(
         client=as_client(client), media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH
     ).extract(a_request())

@@ -1932,6 +1932,119 @@ No transaction will carry `message_timestamp` again, since every guess is now
 questioned before it commits. Rows already in the ledger keep it and the
 dashboard keeps rendering it, which is the honest reading of what those rows are.
 
+### Several images, one call, and a group that says how many receipts they are
+
+**Decided 2026-08-12.**
+
+Reported by Ashrit on 2026-08-10 with the receipt attached: a bill too long to
+photograph in one go was sent as two images, and the ledger got the second one.
+The `raw_extractions` rows say exactly what happened. Two calls, eight seconds
+apart. One with four line items and no total. One with no line items and a total
+of ₹258. Neither reconciled, so nothing was stored, and both were billed. About
+five cents for nothing, and a receipt the user then had to re-send.
+
+The cause was structural. `submit_image` took one image, made one call, and
+returned one result, so an album could only ever be N independent readings of N
+fragments. Nothing anywhere had both images in front of it.
+
+**The shape Ashrit picked**, out of three offered: one call returns a list.
+`ExtractionGroup` wraps `receipts: list[ExtractionResult]` and the inner model
+is untouched. That last part is why it was picked: 32 eval fixtures describe one
+receipt each and are scored field by field, and a wrapper that changed the inner
+schema would have invalidated all of them silently.
+
+The group commits before it transcribes, which is brief 21.2 applied one level
+up. `image_count` ("count them") and `receipt_count` come before `receipts`, and
+a validator rejects a group whose count disagrees with its own list. The count is
+generated first and is exactly the field a model can contradict two hundred
+tokens later, so it is checked rather than trusted.
+
+**Prompt v2**, because the response schema changed and v1 describes the old one.
+v1 stays on disk: rows in `raw_extractions` name the prompt that produced them
+and are immutable, so deleting a version deletes the meaning of those rows.
+`group_from_json` reads both shapes, and the two cannot be confused, since both
+forbid unknown fields and neither one's required fields appear in the other.
+
+**Telegram does not deliver an album.** It delivers each photograph as its own
+update carrying a shared `media_group_id`, in no guaranteed order, with no count
+and nothing marking the last one. The only signal that one is complete is that
+nothing more has arrived, so `_ingest` holds the first for two seconds and
+submits whatever accumulated, sorted by message id. A job queue would be tidier
+and needs APScheduler, which invariant 12 does not permit installing to avoid
+three lines.
+
+**Three things the ledger needed.**
+
+- `receipt_index` on `transactions` and `pending_receipts`. Several receipts
+  point at one immutable extraction, and this says which.
+- `pending_receipts.image_path` became `image_paths`, a JSON array. A long
+  receipt leaves several files and invariant 7 does not permit keeping any.
+- `transactions.image_sha256` is now the batch digest for the first receipt of a
+  batch and a derived digest for every one after. The partial unique index on
+  `(user_id, image_sha256)` is why: two receipts out of one batch would collide
+  on it. Keeping the first one's key equal to the batch digest is what makes the
+  whole change invisible to every row already in the ledger.
+
+`key_hash` in the pending store had the same collision one layer up and was
+caught by a test rather than by a user: it hashed `(chat_id, message_id)` only,
+so two receipts of one batch shared a row and the second `put` overwrote the
+first. `part` is appended only when non-zero, so keyboards already on screen
+across the deploy keep working.
+
+**What this does not do.** It does not split a batch that the model groups
+wrongly. If it calls two purchases one receipt, the user sees one confirm prompt
+with everything in it and the fix is to discard and send them separately. That
+is visible and recoverable, which the old failure was not.
+
+---
+
+### Proposal for brief section 3.11, not written into the brief
+
+**Raised 2026-08-12. Needs Ashrit's ruling before anything is built.**
+
+Section 3.11 is cited four times and has never existed. It is meant to define
+tiling for the very tall receipts, and CLAUDE.md says the brief does not get
+silently deviated from, so this is a proposal in the decisions log rather than a
+section invented in the brief.
+
+**What the gap actually is.** A 30-item receipt photographed end to end is a very
+tall, very narrow image. Two things can go wrong with one and they need telling
+apart:
+
+1. The image is downscaled before the model reads it, so the small print at the
+   bottom is gone before extraction starts.
+2. The image is read fine and the model stops early, returning the first N items.
+
+Only the first is a tiling problem. `media_resolution` is already plumbed through
+`GeminiProvider` and left unset, which was the placeholder for this.
+
+**The proposal, in order, cheapest first.**
+
+- **Measure before building.** `count_input_tokens` is free on Gemini and already
+  called. Render or photograph a 30-item receipt, count the tokens at each
+  `media_resolution` setting, and run it through the eval scorer. If accuracy at
+  the default is fine, 3.11 is one sentence saying so and nothing is built.
+- **If it is a resolution problem**, set `media_resolution` high for images past
+  a height threshold and record the setting in `raw_extractions.extra`, so a
+  regression is attributable. One config knob, no new dependency, no invariant
+  touched.
+- **If it is a stopping problem**, tiling does not help and the answer is a
+  continuation field on the schema, not an image change.
+- **Slicing the image into overlapping strips is the last resort**, and it needs
+  a ruling first: invariant 9 forbids image editing, upscaling and enhancement
+  anywhere in the pipeline, and whether cropping to strips counts is Ashrit's
+  call, not mine. It is the same question the PDF-render path in 3.10 raises.
+
+**What the 2026-08-12 work already covers.** A receipt sent as two photographs is
+now one call and one row, which is the ordinary way a person handles a bill too
+long for one frame. That removes the pressure from 3.11 without answering it: it
+is the user solving the framing problem manually.
+
+**Confidence.** High that the batch path is the right answer for the common case,
+because it is the failure that was actually reported and it is now tested. Low on
+anything about how Gemini tiles a tall image, because I have not measured it and
+have no first-party source in front of me. That is what step one is for.
+
 ---
 
 ## Still open
@@ -1939,7 +2052,9 @@ dashboard keeps rendering it, which is the honest reading of what those rows are
 - **Brief sections 3.10 and 3.11 do not exist.** Referenced four times, never
   written. 3.10 defines the PDF-text-layer versus vision router and blocks
   commit 5. 3.11 defines tiling for the tall 30-item receipts. Not inventing
-  either one.
+  either one. A proposal for 3.11 is written up above, dated 2026-08-12, and
+  wants a ruling on one question in particular: whether slicing a tall image
+  into overlapping strips counts as editing it under invariant 9.
 - **Thirty of the 32 eval PNGs are absent**, along with `blinkit_000.png` (the
   redacted real receipt) and `docs/RASEED_TEST_DATA_PROMPTS.md`. Needed at
   commit 6, not before. Either Ashrit restores them or they get re-rendered,

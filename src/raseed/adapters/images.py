@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -34,6 +35,19 @@ SUFFIX_BY_MIME: Final[dict[str, str]] = {
 def sha256_of(data: bytes) -> str:
     """The dedupe key from brief 3.6, taken from the bytes as received."""
     return hashlib.sha256(data).hexdigest()
+
+
+def batch_sha256(digests: Sequence[str]) -> str:
+    """One dedupe key for the images that arrived together, in their order.
+
+    A single image is its own batch and keeps its own digest, so every row
+    written before batches existed still dedupes against a resend of the same
+    photograph. Order matters: two pages the other way round are a different
+    reading, and the model was given them in the order they arrived.
+    """
+    if len(digests) == 1:
+        return digests[0]
+    return hashlib.sha256("\n".join(digests).encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,4 +131,10 @@ class ImageStore:
         return sum(1 for path in self._root.iterdir() if path.is_file())
 
 
-__all__ = ["SUFFIX_BY_MIME", "ImageStore", "StoredImage", "sha256_of"]
+__all__ = [
+    "SUFFIX_BY_MIME",
+    "ImageStore",
+    "StoredImage",
+    "batch_sha256",
+    "sha256_of",
+]

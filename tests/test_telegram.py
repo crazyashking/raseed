@@ -53,8 +53,12 @@ from raseed.adapters.telegram import (
     keyboard_for,
 )
 from raseed.db.models import User
-from raseed.extraction.providers.base import ExtractionRequest, ProviderResult
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.providers.base import (
+    ExtractionRequest,
+    ImagePayload,
+    ProviderResult,
+)
+from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 
 NOW = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
 PNG = b"\x89PNG\r\n\x1a\n" + b"receipt-bytes"
@@ -68,10 +72,19 @@ STRANGER_ID = 9999
 
 
 class StubProvider:
-    """Answers with one fixed extraction. Never touches the network."""
+    """Answers with one fixed extraction, and records what it was asked.
+
+    The requests are kept because the album tests are entirely about what
+    reached the model: how many calls, how many images in each, in what order.
+    """
 
     def __init__(self, outcome: ExtractionResult) -> None:
         self._outcome = outcome
+        self.seen: list[ExtractionRequest] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.seen)
 
     @property
     def model_id(self) -> str:
@@ -80,9 +93,10 @@ class StubProvider:
     def count_input_tokens(self, _request: ExtractionRequest) -> int:
         return 1970
 
-    def extract(self, _request: ExtractionRequest) -> ProviderResult:
+    def extract(self, request: ExtractionRequest) -> ProviderResult:
+        self.seen.append(request)
         return ProviderResult(
-            extraction=self._outcome,
+            group=ExtractionGroup.of(self._outcome),
             model_id=self.model_id,
             prompt_version="v1",
             response_text=self._outcome.model_dump_json(),
@@ -121,9 +135,14 @@ def store(tmp_path: Path) -> ImageStore:
 
 
 @pytest.fixture
-def flow(store: ImageStore) -> ReceiptFlow:
+def provider() -> StubProvider:
+    return StubProvider(an_extraction())
+
+
+@pytest.fixture
+def flow(store: ImageStore, provider: StubProvider) -> ReceiptFlow:
     return ReceiptFlow(
-        provider=StubProvider(an_extraction()),
+        provider=provider,
         images=store,
         pending=InMemoryPendingStore(),
         config=FlowConfig(),
@@ -219,17 +238,17 @@ def test_the_unreadable_file_message_says_what_does_work() -> None:
 def pending_for(
     flow: ReceiptFlow, session: Session, user: User, *, message_id: int = 1
 ) -> PendingKey:
-    result = flow.submit_image(
+    results = flow.submit_images(
         session,
         user_id=user.id,
         chat_id=999,
         message_id=message_id,
-        data=PNG + bytes([message_id]),
-        mime_type="image/png",
+        images=[ImagePayload(data=PNG + bytes([message_id]), mime_type="image/png")],
         message_date=NOW,
     )
-    assert result.pending is not None
-    return result.pending.key
+    assert len(results) == 1
+    assert results[0].pending is not None
+    return results[0].pending.key
 
 
 def test_a_balanced_receipt_offers_confirm_and_discard(
@@ -742,3 +761,117 @@ def test_the_expired_message_names_the_cause_and_the_consequence() -> None:
     assert "restart" not in EXPIRED_MESSAGE.lower()
     for coaching in ("crop", "rotate", "as a file", "retake", "clearer", "better"):
         assert coaching not in EXPIRED_MESSAGE.lower()
+
+
+# ---------------------------------------------------------------------------
+# Albums (2026-08-12)
+# ---------------------------------------------------------------------------
+
+
+class Album:
+    """One photograph of an album, as Telegram actually delivers it.
+
+    Telegram sends each image of an album as its own update carrying a shared
+    `media_group_id`, in no guaranteed order, with no count and nothing marking
+    the last one. That shape is the whole reason `_ingest` buffers, so the stub
+    reproduces it rather than handing over a list.
+    """
+
+    def __init__(self, group: str | None, message_id: int, replies: Replier) -> None:
+        self.group = group
+        self.message_id = message_id
+        self.replies = replies
+
+    def update(self) -> Update:
+        return cast(
+            "Update",
+            SimpleNamespace(
+                effective_user=SimpleNamespace(id=ALLOWED_ID),
+                message=SimpleNamespace(
+                    media_group_id=self.group,
+                    message_id=self.message_id,
+                    chat_id=999,
+                    date=NOW,
+                    reply_text=self.replies.reply_text,
+                ),
+            ),
+        )
+
+
+async def deliver(bot: RaseedBot, *photos: Album) -> None:
+    """Hand each photograph to the bot the way the runtime would: concurrently."""
+    await asyncio.gather(
+        *(
+            bot._ingest(photo.update(), data=PNG + bytes([photo.message_id]), mime_type="image/png")
+            for photo in photos
+        )
+    )
+
+
+@pytest.fixture
+def quick_bot(flow: ReceiptFlow, seeded: tuple[Session, User]) -> RaseedBot:
+    """A wired bot that does not make the test wait two real seconds."""
+    session, _ = seeded
+    session.commit()
+    return RaseedBot(
+        flow=flow,
+        session_factory=sessionmaker(bind=session.get_bind()),
+        allowed_user_ids=frozenset({ALLOWED_ID}),
+        clock=lambda: NOW,
+        user_id_secret=SECRET,
+        album_wait=0.05,
+    )
+
+
+def test_an_album_becomes_one_call(quick_bot: RaseedBot, provider: StubProvider) -> None:
+    """The live failure: two photographs of one receipt were two paid calls."""
+    replies = Replier()
+    asyncio.run(deliver(quick_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
+
+    assert provider.calls == 1
+    assert len(provider.seen) == 1
+    assert len(provider.seen[0].images) == 2
+    assert len(replies.said) == 1
+
+
+def test_a_lone_photograph_is_not_waited_on(quick_bot: RaseedBot, provider: StubProvider) -> None:
+    """No `media_group_id` means nothing more is coming, so nothing is held."""
+    replies = Replier()
+    asyncio.run(deliver(quick_bot, Album(None, 10, replies)))
+
+    assert provider.calls == 1
+    assert len(provider.seen[0].images) == 1
+
+
+def test_two_albums_at_once_do_not_mix(quick_bot: RaseedBot, provider: StubProvider) -> None:
+    replies = Replier()
+    asyncio.run(
+        deliver(
+            quick_bot,
+            Album("g1", 10, replies),
+            Album("g2", 20, replies),
+            Album("g1", 11, replies),
+        )
+    )
+
+    assert provider.calls == 2
+    assert sorted(len(request.images) for request in provider.seen) == [1, 2]
+
+
+def test_an_album_is_read_in_the_order_it_was_sent(
+    quick_bot: RaseedBot, provider: StubProvider
+) -> None:
+    """Out-of-order delivery is normal, and page two before page one is a
+    different reading of the same bill."""
+    replies = Replier()
+    asyncio.run(deliver(quick_bot, Album("g1", 12, replies), Album("g1", 11, replies)))
+
+    assert provider.calls == 1
+    assert [payload.data[-1] for payload in provider.seen[0].images] == [11, 12]
+
+
+def test_nothing_is_held_after_an_album_is_read(quick_bot: RaseedBot) -> None:
+    """The buffer is in memory. Anything left in it is a leak that grows."""
+    replies = Replier()
+    asyncio.run(deliver(quick_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
+    assert quick_bot._albums == {}

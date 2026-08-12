@@ -14,6 +14,7 @@ receipt is discarded. `record_transaction` is called only on confirm.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 from collections.abc import Sequence
 
 from sqlalchemy import select
@@ -37,7 +38,7 @@ from raseed.enrichment.categorize import Decision
 from raseed.enrichment.categorize import Outcome as Stage2Outcome
 from raseed.enrichment.providers.base import CategorizationProviderResult
 from raseed.extraction.providers.base import ProviderResult
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import group_from_json
 from raseed.validation.reconcile import Outcome, Reconciliation
 
 #: The gate's outcomes that may be stored, mapped onto their database enum.
@@ -47,6 +48,24 @@ STORABLE_OUTCOMES: dict[Outcome, ReconciliationOutcome] = {
     Outcome.SKIPPED: ReconciliationOutcome.SKIPPED,
     Outcome.CLASS_2: ReconciliationOutcome.CLASS_2,
 }
+
+
+def receipt_sha256(batch: str, index: int) -> str:
+    """The dedupe key for one receipt out of a batch.
+
+    `transactions` carries a partial unique index on `(user_id, image_sha256)`
+    for live rows, which is what stops the same photograph landing twice. Two
+    receipts read out of one batch would collide on it, so every receipt after
+    the first gets a key derived from the batch and its position.
+
+    The first receipt keeps the batch's own digest untouched. That is what makes
+    this change invisible to every row already in the ledger, and it keeps the
+    common case, one batch holding one receipt, keyed on exactly what it was
+    keyed on before.
+    """
+    if index == 0:
+        return batch
+    return hashlib.sha256(f"{batch}:{index}".encode()).hexdigest()
 
 
 class NotStorableError(RuntimeError):
@@ -125,8 +144,8 @@ def record_transaction(
     reconciliation: Reconciliation,
     occurred_on_local: dt.date,
     date_source: DateSource,
+    receipt_index: int = 0,
     merchant: Merchant | None = None,
-    occurred_at_utc: dt.datetime | None = None,
     enrichment: Stage2Outcome | None = None,
 ) -> Transaction:
     """Commit a confirmed receipt to the ledger.
@@ -135,6 +154,10 @@ def record_transaction(
     separately, so what is stored is provably what the model said. The user is
     taken from `raw` for the same reason: passing it alongside would allow a
     caller to file one user's receipt under another.
+
+    `receipt_index` picks one receipt out of that response. A batch of images
+    can hold several, they all point at the same immutable row, and the index is
+    the only thing that tells them apart.
 
     `enrichment` is Stage 2's verdict, keyed by line-item position. It is
     optional because Stage 2 is not allowed to be able to lose a receipt: a
@@ -155,20 +178,33 @@ def record_transaction(
         )
         raise NotStorableError(msg)
 
-    extraction = ExtractionResult.model_validate_json(raw.response_json)
+    group = group_from_json(raw.response_json)
+    try:
+        extraction = group.receipts[receipt_index]
+    except IndexError as exc:
+        msg = (
+            f"receipt {receipt_index} was asked for and extraction {raw.id} holds "
+            f"{len(group.receipts)}"
+        )
+        raise NotStorableError(msg) from exc
 
     transaction = Transaction(
         user_id=user_id,
         raw_extraction_id=raw.id,
         merchant_id=merchant.id if merchant else None,
         source=raw.source,
-        image_sha256=raw.image_sha256,
+        image_sha256=(
+            receipt_sha256(raw.image_sha256, receipt_index) if raw.image_sha256 else None
+        ),
+        receipt_index=receipt_index,
         order_id=extraction.order_id,
         currency=extraction.currency,
         grand_total_minor=extraction.grand_total_minor or 0,
         unaccounted_adjustment_minor=reconciliation.unaccounted_adjustment_minor or 0,
         reconciliation_outcome=outcome,
-        occurred_at_utc=occurred_at_utc,
+        # `occurred_at_utc` is left null. Nothing has ever passed one, because a
+        # screenshot prints no clock, and invariant 6 buckets on the local date
+        # regardless. The column stays for the receipts that do print a time.
         occurred_on_local=occurred_on_local,
         date_source=date_source,
     )
@@ -327,6 +363,7 @@ __all__ = [
     "STORABLE_OUTCOMES",
     "NotStorableError",
     "ensure_merchant",
+    "receipt_sha256",
     "record_extraction",
     "record_transaction",
     "soft_delete_transaction",

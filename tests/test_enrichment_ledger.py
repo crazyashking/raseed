@@ -29,7 +29,7 @@ from raseed.enrichment.categorize import Item, categorize
 from raseed.enrichment.providers.base import CategorizationProviderResult
 from raseed.enrichment.schemas import CategorizationResult
 from raseed.extraction.providers.base import ProviderResult
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 from raseed.validation.reconcile import reconcile
 
 ALLOWED = ("groceries", "food-and-dining", "drinks", "entertainment", "uncategorized")
@@ -70,7 +70,7 @@ def stored_extraction(session: Session, user: User, extraction: ExtractionResult
         session,
         user_id=user.id,
         result=ProviderResult(
-            extraction=extraction,
+            group=ExtractionGroup.of(extraction),
             model_id="gemini-3.6-flash",
             prompt_version="v1",
             response_text=extraction.model_dump_json(),

@@ -10,12 +10,13 @@ No API calls, no images, no `data/`.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Date, DateTime, Integer, Table, inspect, select
+from sqlalchemy import Date, DateTime, Integer, Table, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -611,3 +612,60 @@ def test_the_migration_matches_the_models(tmp_path: Path, monkeypatch: pytest.Mo
             f"{table.name} drifted between models.py and the migration"
         )
     engine.dispose()
+
+
+def test_an_existing_image_path_survives_the_move_to_a_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one migration in this repo that carries data rather than adding a column.
+
+    A fresh database has no rows, so upgrading one proves nothing about the
+    database that is actually running. This stops at the revision before,
+    writes the row shape that exists there, and then upgrades.
+
+    A Windows path is used on purpose: it is full of backslashes, which is why
+    the migration goes through `json_array` instead of building the array with
+    string concatenation.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    db_path = tmp_path / "carried.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    config = Config(str(repo_root / "alembic.ini"))
+    config.set_main_option("script_location", str(repo_root / "alembic"))
+    command.upgrade(config, "6777f3118190")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    stored = r"C:\Users\someone\data\incoming\abc123.jpg"
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO users (id) VALUES ('u1')"))
+        connection.execute(
+            text(
+                "INSERT INTO raw_extractions "
+                "(id, user_id, source, stage, model_id, prompt_version, response_json) "
+                "VALUES ('r1', 'u1', 'TELEGRAM_IMAGE', 'EXTRACTION', 'm', 'v1', '{}')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pending_receipts "
+                "(id, user_id, key_hash, raw_extraction_id, occurred_on_local, date_source, "
+                "image_path, gap_accepted, created_at) "
+                "VALUES ('p1', 'u1', 'k', 'r1', '2026-08-11', 'MESSAGE_TIMESTAMP', "
+                ":path, 0, '2026-08-11 00:00:00')"
+            ),
+            {"path": stored},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT image_paths, receipt_index FROM pending_receipts WHERE id = 'p1'")
+        ).one()
+    engine.dispose()
+
+    assert json.loads(row[0]) == [stored]
+    assert row[1] == 0

@@ -58,10 +58,11 @@ from raseed.enrichment.providers.base import (
 from raseed.enrichment.schemas import CategorizationResult, ItemCategory
 from raseed.extraction.providers.base import (
     ExtractionRequest,
+    ImagePayload,
     ProviderResult,
     ProviderTransientError,
 )
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 from raseed.timezones import zone
 from raseed.validation.reconcile import Outcome, reconcile
 
@@ -78,9 +79,15 @@ def an_extraction(name: str = "blinkit_001", **overrides: object) -> ExtractionR
 
 
 class StubProvider:
-    """Returns whatever it was given, or raises it."""
+    """Returns whatever it was given, or raises it.
 
-    def __init__(self, outcome: ExtractionResult | Exception) -> None:
+    Takes a bare `ExtractionResult` as a convenience, because most tests are
+    about one receipt and wrapping every one of them by hand would say nothing.
+    """
+
+    def __init__(self, outcome: ExtractionResult | ExtractionGroup | Exception) -> None:
+        if isinstance(outcome, ExtractionResult):
+            outcome = ExtractionGroup.of(outcome)
         self._outcome = outcome
         self.calls = 0
 
@@ -96,7 +103,7 @@ class StubProvider:
         if isinstance(self._outcome, Exception):
             raise self._outcome
         return ProviderResult(
-            extraction=self._outcome,
+            group=self._outcome,
             model_id=self.model_id,
             prompt_version="v1",
             response_text=self._outcome.model_dump_json(),
@@ -156,13 +163,35 @@ def make_flow(
 def submit(
     flow: ReceiptFlow, session: Session, user: User, *, data: bytes = PNG, message_id: int = 1
 ) -> FlowResult:
-    return flow.submit_image(
+    """Submit one image and return the single result it produced.
+
+    Most tests are about one receipt, and asserting on `[0]` in every one of
+    them would bury what they are actually checking. Tests about batches call
+    `submit_images` directly.
+    """
+    results = submit_all(flow, session, user, images=[image(data)], message_id=message_id)
+    assert len(results) == 1, results
+    return results[0]
+
+
+def image(data: bytes = PNG) -> ImagePayload:
+    return ImagePayload(data=data, mime_type="image/png")
+
+
+def submit_all(
+    flow: ReceiptFlow,
+    session: Session,
+    user: User,
+    *,
+    images: list[ImagePayload],
+    message_id: int = 1,
+) -> list[FlowResult]:
+    return flow.submit_images(
         session,
         user_id=user.id,
         chat_id=999,
         message_id=message_id,
-        data=data,
-        mime_type="image/png",
+        images=images,
         message_date=NOW,
     )
 
@@ -251,8 +280,7 @@ def test_three_receipts_do_not_share_state(seeded: tuple[Session, User], store: 
     # The other two are untouched and still awaiting a decision.
     for other in pendings[:2]:
         assert other is not None
-        assert other.image_path is not None
-        assert other.image_path.exists()
+        assert all(path.exists() for path in other.image_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +355,8 @@ def test_confirming_writes_the_ledger_and_deletes_the_image(
     flow = make_flow(StubProvider(an_extraction()), store)
     pending = submit(flow, session, user).pending
     assert pending is not None
-    image_path = pending.image_path
-    assert image_path is not None and image_path.exists()
+    (image_path,) = pending.image_paths
+    assert image_path.exists()
 
     result = commit(flow, session, pending.key)
     session.commit()
@@ -370,15 +398,15 @@ def test_a_failed_confirm_leaves_the_button_usable(
 
     # The entry is still there, the image is still there, nothing was stored.
     assert flow.pending_for(session, pending.key) is not None
-    assert pending.image_path is not None
-    assert pending.image_path.exists()
+    assert pending.image_paths
+    assert all(path.exists() for path in pending.image_paths)
     assert session.scalars(select(Transaction)).all() == []
 
     # And the second tap on the same button works.
     monkeypatch.undo()
     result = commit(flow, session, pending.key)
     assert result.step is Step.STORED
-    assert not pending.image_path.exists()
+    assert not any(path.exists() for path in pending.image_paths)
 
 
 def test_stage_two_failing_never_costs_the_receipt(
@@ -513,8 +541,8 @@ def test_discarding_stores_nothing_and_deletes_the_image(
 
     assert result.step is Step.DISCARDED
     assert session.scalars(select(Transaction)).all() == []
-    assert pending.image_path is not None
-    assert not pending.image_path.exists()
+    assert pending.image_paths
+    assert not any(path.exists() for path in pending.image_paths)
 
 
 def test_a_decision_cannot_be_applied_twice(
@@ -609,7 +637,7 @@ def test_the_ledger_refuses_a_class_1_extraction(seeded: tuple[Session, User]) -
         session,
         user_id=user.id,
         result=ProviderResult(
-            extraction=extraction,
+            group=ExtractionGroup.of(extraction),
             model_id="gemini-3.6-flash",
             prompt_version="v1",
             response_text=extraction.model_dump_json(),
@@ -801,13 +829,12 @@ def test_the_pending_store_does_not_deadlock_against_its_caller(
         session.commit()
 
     with file_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         # Still inside the transaction that wrote the extraction.
@@ -845,13 +872,12 @@ def test_a_pending_row_rolls_back_with_the_extraction_it_points_at(
         session.commit()
 
     with file_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         assert result.step is Step.AWAITING_CONFIRMATION
@@ -886,13 +912,12 @@ def test_a_restart_does_not_kill_an_outstanding_confirm(
         )
 
     with shared_sessions() as session:
-        result = build().submit_image(
+        (result,) = build().submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         session.commit()
@@ -926,13 +951,12 @@ def test_a_confirm_still_cannot_be_applied_twice(
     )
 
     with shared_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         session.commit()
@@ -968,13 +992,12 @@ def test_no_telegram_identifier_reaches_the_database(
         clock=lambda: NOW,
     )
     with shared_sessions() as session:
-        flow.submit_image(
+        flow.submit_images(
             session,
             user_id=user_id,
             chat_id=chat_id,
             message_id=4242,
-            data=PNG,
-            mime_type="image/png",
+            images=[image()],
             message_date=NOW,
         )
         session.commit()
@@ -1007,13 +1030,12 @@ def test_a_stored_pending_receipt_keeps_the_decisions_already_made(
         clock=lambda: NOW,
     )
     with shared_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         session.commit()
@@ -1052,17 +1074,16 @@ def test_a_persisted_pending_receipt_still_expires(
         clock=lambda: clock["now"],
     )
     with shared_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         session.commit()
-    assert result.pending is not None and result.pending.image_path is not None
+    assert result.pending is not None and result.pending.image_paths
 
     clock["now"] = NOW + dt.timedelta(hours=25)
     with shared_sessions() as session:
@@ -1072,7 +1093,9 @@ def test_a_persisted_pending_receipt_still_expires(
         dead = flow.expire_stale(session)
         session.commit()
     assert len(dead) == 1
-    assert not result.pending.image_path.exists(), "invariant 7: the image goes too"
+    assert not any(p.exists() for p in result.pending.image_paths), (
+        "invariant 7: the image goes too"
+    )
 
 
 def test_expiring_deletes_the_image(seeded: tuple[Session, User], store: ImageStore) -> None:
@@ -1087,13 +1110,13 @@ def test_expiring_deletes_the_image(seeded: tuple[Session, User], store: ImageSt
         clock=lambda: clock["now"],
     )
     pending = submit(flow, session, user).pending
-    assert pending is not None and pending.image_path is not None
+    assert pending is not None and pending.image_paths
 
     clock["now"] = NOW + dt.timedelta(hours=25)
     dead = flow.expire_stale(session)
 
     assert len(dead) == 1
-    assert not pending.image_path.exists()
+    assert not any(path.exists() for path in pending.image_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,13 +1318,12 @@ def test_a_guessed_date_survives_the_pending_store(
         session.commit()
 
     with file_sessions() as session:
-        result = flow.submit_image(
+        (result,) = flow.submit_images(
             session,
             user_id=user_id,
             chat_id=999,
             message_id=1,
-            data=PNG,
-            mime_type="image/png",
+            images=[image(PNG)],
             message_date=NOW,
         )
         assert result.pending is not None
@@ -1371,8 +1393,7 @@ def test_the_date_question_is_asked_before_stage_two_is_paid_for(
     assert flow.confirm(session, pending.key).step is Step.AWAITING_DATE
     assert categorizer.calls == 0
     # And the image is still there, so the receipt is not lost either.
-    assert pending.image_path is not None
-    assert pending.image_path.exists()
+    assert all(path.exists() for path in pending.image_paths)
 
 
 def test_an_unanswered_date_question_leaves_the_button_usable(
@@ -1434,6 +1455,282 @@ def test_the_date_question_says_nothing_about_how_to_send(
     text = flow.confirm(session, pending.key).message.lower()
     for banned in ("send", "resend", "photo", "screenshot", "crop", "rotate", "file"):
         assert banned not in text, text
+
+
+# ---------------------------------------------------------------------------
+# Batches: several images that may be one receipt or several
+# ---------------------------------------------------------------------------
+
+
+def pages(*names: str) -> ExtractionGroup:
+    """One receipt per name, as one call would return them."""
+    return ExtractionGroup.of(*(an_extraction(name) for name in names), images=len(names))
+
+
+def two_images() -> list[ImagePayload]:
+    return [image(PNG + b"page-one"), image(PNG + b"page-two")]
+
+
+def test_two_images_of_one_receipt_are_read_once(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The live failure from 2026-08-10, and the reason any of this exists.
+
+    Two photographs of one long receipt used to be two calls eight seconds
+    apart: one holding four items and no total, one holding a total and no
+    items. Neither reconciled, nothing was stored, and both were paid for.
+    """
+    session, user = seeded
+    provider = StubProvider(pages("blinkit_001"))
+    flow = make_flow(provider, store)
+
+    results = submit_all(flow, session, user, images=two_images())
+
+    assert provider.calls == 1
+    assert [result.step for result in results] == [Step.AWAITING_CONFIRMATION]
+    assert session.scalars(select(RawExtraction)).one() is not None
+
+
+def test_two_receipts_in_one_batch_get_a_prompt_each(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A week of catching up arrives the same way a long receipt does."""
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001", "blinkit_026")), store)
+
+    results = submit_all(flow, session, user, images=two_images())
+
+    assert [result.step for result in results] == [Step.AWAITING_CONFIRMATION] * 2
+    pendings = [result.pending for result in results]
+    assert all(pending is not None for pending in pendings)
+    # Brief 16.4, one level down: confirming the second must not commit the first.
+    assert len({pending.key for pending in pendings if pending}) == 2
+    assert [pending.receipt_index for pending in pendings if pending] == [0, 1]
+
+
+def test_confirming_one_receipt_of_a_batch_leaves_the_other_alone(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001", "blinkit_026")), store)
+    first, second = submit_all(flow, session, user, images=two_images())
+    assert first.pending is not None and second.pending is not None
+
+    stored = commit(flow, session, second.pending.key)
+    session.commit()
+
+    assert stored.step is Step.STORED
+    assert stored.transaction is not None
+    # The second receipt, not the first. `blinkit_026` carries the coupon.
+    assert stored.transaction.grand_total_minor == second.pending.extraction.grand_total_minor
+    assert flow.pending_for(session, first.pending.key) is not None
+
+
+def test_both_receipts_of_a_batch_can_be_logged(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The partial unique index on `(user_id, image_sha256)` is what this is about.
+
+    Both receipts came out of the same batch, so both would carry the same
+    digest without `receipt_sha256`, and the second insert would die on an index
+    the user has no way to understand.
+    """
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001", "blinkit_026")), store)
+    first, second = submit_all(flow, session, user, images=two_images())
+    assert first.pending is not None and second.pending is not None
+
+    assert commit(flow, session, first.pending.key).step is Step.STORED
+    assert commit(flow, session, second.pending.key).step is Step.STORED
+    session.commit()
+
+    rows = session.scalars(select(Transaction)).all()
+    assert len(rows) == 2
+    assert {row.receipt_index for row in rows} == {0, 1}
+    assert len({row.image_sha256 for row in rows}) == 2
+
+
+def test_the_images_outlive_the_first_confirm_of_a_batch(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Invariant 7 says gone after confirm. It does not say gone after somebody
+    else's confirm, and a receipt still waiting is a receipt that has not been
+    answered."""
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001", "blinkit_026")), store)
+    first, second = submit_all(flow, session, user, images=two_images())
+    assert first.pending is not None and second.pending is not None
+    assert len(first.pending.image_paths) == 2
+
+    commit(flow, session, first.pending.key)
+    session.commit()
+
+    # Both entries hold both files, and deleting is idempotent, so the second
+    # confirm finds nothing to remove and nothing is left behind either way.
+    assert not any(path.exists() for path in second.pending.image_paths)
+    assert commit(flow, session, second.pending.key).step is Step.STORED
+
+
+def test_a_batch_of_nothing_but_junk_stores_nothing(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Invariant 11, at the level the model now answers at."""
+    session, user = seeded
+    flow = make_flow(StubProvider(ExtractionGroup.of(images=2)), store)
+
+    results = submit_all(flow, session, user, images=two_images())
+
+    assert [result.step for result in results] == [Step.NOT_A_RECEIPT]
+    assert session.scalars(select(Transaction)).all() == []
+    # Invariant 7: nothing will ever be confirmed, so nothing is kept.
+    assert len(store) == 0
+    # The reading is still recorded. A wrong answer is evidence about the prompt.
+    assert session.scalars(select(RawExtraction)).one() is not None
+
+
+def test_one_bad_reading_does_not_cost_the_rest_of_the_batch(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Class 1 is per receipt, so a batch is not all-or-nothing."""
+    session, user = seeded
+    # No total could be read, which is Class 1: a photo problem, store nothing.
+    unbalanced = an_extraction("blinkit_001", grand_total_minor=None)
+    flow = make_flow(
+        StubProvider(ExtractionGroup.of(unbalanced, an_extraction("blinkit_026"), images=2)),
+        store,
+    )
+
+    results = submit_all(flow, session, user, images=two_images())
+
+    assert [result.step for result in results] == [Step.REJECTED, Step.AWAITING_CONFIRMATION]
+    assert results[1].pending is not None
+
+
+def test_resending_the_same_pair_is_caught_before_it_is_paid_for(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    provider = StubProvider(pages("blinkit_001"))
+    flow = make_flow(provider, store)
+    (first,) = submit_all(flow, session, user, images=two_images())
+    assert first.pending is not None
+    commit(flow, session, first.pending.key)
+    session.commit()
+
+    (again,) = submit_all(flow, session, user, images=two_images(), message_id=2)
+
+    assert again.step is Step.DUPLICATE
+    assert provider.calls == 1, "the second batch must not reach the model"
+
+
+def test_the_same_two_pages_the_other_way_round_is_a_different_batch(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Order is what the model was given, so it is part of what was read."""
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001")), store)
+    (first,) = submit_all(flow, session, user, images=two_images())
+    assert first.pending is not None
+    commit(flow, session, first.pending.key)
+    session.commit()
+
+    (again,) = submit_all(flow, session, user, images=list(reversed(two_images())), message_id=2)
+    assert again.step is Step.AWAITING_CONFIRMATION
+
+
+def test_a_single_image_still_dedupes_on_its_own_digest(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Every row already in the ledger is keyed this way, and stays reachable."""
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001")), store)
+    result = submit(flow, session, user)
+    assert result.pending is not None
+    stored = commit(flow, session, result.pending.key)
+    session.commit()
+
+    assert stored.transaction is not None
+    assert stored.transaction.image_sha256 == sha256_of(PNG)
+
+
+def test_a_batch_that_the_model_cannot_read_keeps_every_image(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Brief 16.5, over more than one file."""
+    session, user = seeded
+    flow = make_flow(StubProvider(ProviderTransientError("rate limited")), store)
+
+    results = submit_all(flow, session, user, images=two_images())
+
+    assert [result.step for result in results] == [Step.EXTRACTION_FAILED]
+    assert len(store) == 2
+
+
+def test_nothing_at_all_is_not_a_call(seeded: tuple[Session, User], store: ImageStore) -> None:
+    session, user = seeded
+    provider = StubProvider(pages("blinkit_001"))
+    assert submit_all(make_flow(provider, store), session, user, images=[]) == []
+    assert provider.calls == 0
+
+
+def test_a_batch_says_which_receipt_of_how_many_it_is(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Two confirm prompts at once are otherwise indistinguishable from a double read."""
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001", "blinkit_026")), store)
+
+    first, second = submit_all(flow, session, user, images=two_images())
+
+    assert first.message.startswith("Receipt 1 of 2")
+    assert second.message.startswith("Receipt 2 of 2")
+
+
+def test_one_receipt_is_not_announced_as_one_of_one(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    session, user = seeded
+    flow = make_flow(StubProvider(pages("blinkit_001")), store)
+    assert "Receipt 1 of" not in submit(flow, session, user).message
+
+
+def test_a_receipt_of_a_batch_survives_a_restart(
+    file_sessions: sessionmaker[Session], store: ImageStore
+) -> None:
+    """The index has to be on disk. Without it a rebuild reads receipt zero for
+    both, and the second confirm files the first receipt's numbers twice."""
+    flow = ReceiptFlow(
+        provider=StubProvider(pages("blinkit_001", "blinkit_026")),
+        images=store,
+        pending=DatabasePendingStore(secret=PENDING_SECRET),
+        config=FlowConfig(),
+        clock=lambda: NOW,
+    )
+
+    with file_sessions() as session:
+        user_id = bootstrap(session).id
+        session.commit()
+
+    with file_sessions() as session:
+        results = flow.submit_images(
+            session,
+            user_id=user_id,
+            chat_id=999,
+            message_id=1,
+            images=two_images(),
+            message_date=NOW,
+        )
+        keys = [result.pending.key for result in results if result.pending]
+        totals = [
+            result.pending.extraction.grand_total_minor for result in results if result.pending
+        ]
+        session.commit()
+
+    with file_sessions() as session:
+        rebuilt = [flow.pending_for(session, key) for key in keys]
+        assert [item.receipt_index for item in rebuilt if item] == [0, 1]
+        assert [item.extraction.grand_total_minor for item in rebuilt if item] == totals
+        assert [item.receipt_count for item in rebuilt if item] == [2, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -1660,7 +1957,7 @@ def burn(session: Session, user: User, micros: int, *, when: dt.datetime = NOW) 
         session,
         user_id=user.id,
         result=ProviderResult(
-            extraction=an_extraction(),
+            group=ExtractionGroup.of(an_extraction()),
             model_id="gemini-3.6-flash",
             prompt_version="v1",
             response_text="{}",

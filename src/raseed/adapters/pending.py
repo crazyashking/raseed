@@ -5,9 +5,11 @@ quick succession and there are three pending confirmations at once. A single
 global "pending receipt" variable produces the classic failure where confirming
 the third one commits the first.
 
-So state is keyed by `(chat_id, message_id)` and that key travels in the inline
-keyboard's callback data. Telegram caps callback data at 64 bytes, which the key
-format below stays comfortably inside.
+So state is keyed by `(chat_id, message_id, part)` and that key travels in the
+inline keyboard's callback data. Telegram caps callback data at 64 bytes, which
+the key format below stays comfortably inside. `part` is which receipt of a
+batch this is, and it is omitted from the encoding when it is zero, so a
+single-receipt button looks exactly as it always did.
 
 Entries expire after 24 hours. An expired entry is not silently dropped: the
 image it points at has to be deleted too, which is why `expire` returns what it
@@ -39,6 +41,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
@@ -47,7 +50,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from raseed.db.models import DateSource, PendingReceiptRow, RawExtraction
-from raseed.extraction.schemas import ExtractionResult
+from raseed.extraction.schemas import ExtractionResult, group_from_json
 from raseed.validation.reconcile import MrpCrossCheck, Reconciliation, cross_check_mrp, reconcile
 
 #: Brief 16.4. Long enough to survive a night, short enough to bound the store.
@@ -65,10 +68,17 @@ class CallbackDataTooLongError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class PendingKey:
-    """Identifies one awaiting confirmation. Brief 16.4."""
+    """Identifies one awaiting confirmation. Brief 16.4.
+
+    `part` is which receipt of the batch this is. Several images sent together
+    can hold several receipts, each with its own confirm keyboard, and they all
+    share the message the first image arrived on. Without it they would share a
+    key as well, which is the exact bug 16.4 exists to prevent, one level down.
+    """
 
     chat_id: int
     message_id: int
+    part: int = 0
 
     def encode(self, action: str) -> str:
         """Pack into callback data.
@@ -80,6 +90,11 @@ class PendingKey:
             msg = f"action may not contain {_SEPARATOR!r}, got {action!r}"
             raise ValueError(msg)
         packed = f"{action}{_SEPARATOR}{self.chat_id}{_SEPARATOR}{self.message_id}"
+        # Omitted when it is zero, which is every button drawn before batches
+        # existed and every batch holding one receipt. That keeps the keyboards
+        # already on somebody's screen working across the deploy that adds this.
+        if self.part:
+            packed = f"{packed}{_SEPARATOR}{self.part}"
         if len(packed.encode("utf-8")) > CALLBACK_DATA_LIMIT:
             msg = f"callback data {packed!r} exceeds {CALLBACK_DATA_LIMIT} bytes"
             raise CallbackDataTooLongError(msg)
@@ -93,12 +108,16 @@ class PendingKey:
             ValueError: The data is not something this bot produced.
         """
         parts = data.split(_SEPARATOR)
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             msg = f"unrecognised callback data: {data!r}"
             raise ValueError(msg)
-        action, chat_id, message_id = parts
+        action, chat_id, message_id = parts[:3]
         try:
-            return action, cls(chat_id=int(chat_id), message_id=int(message_id))
+            return action, cls(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                part=int(parts[3]) if len(parts) == 4 else 0,
+            )
         except ValueError as exc:
             msg = f"unrecognised callback data: {data!r}"
             raise ValueError(msg) from exc
@@ -121,8 +140,23 @@ class PendingReceipt:
     occurred_on_local: dt.date
     created_at: dt.datetime
 
+    #: Which receipt of the batch this is. Always equal to `key.part`; carried
+    #: separately because it is what indexes `raw_extractions`, and the key is a
+    #: transport concern that a second transport would spell differently.
+    receipt_index: int = 0
+
+    #: How many receipts came out of the same batch. Never stored: it is
+    #: recovered by counting them in the immutable extraction, which is the only
+    #: place that can go on being right about it.
+    receipt_count: int = 1
+
     #: Kept until confirm or discard, then deleted. Invariant 7.
-    image_path: Path | None = None
+    #:
+    #: Every image of the batch, because a receipt too long to photograph in one
+    #: go leaves several files and invariant 7 does not permit keeping any of
+    #: them. Two receipts out of one batch both list all of them; deleting is
+    #: idempotent, so the second one finds nothing left and that is the point.
+    image_paths: tuple[Path, ...] = ()
 
     #: Set when the user picks one from the quick-pick keyboard. Brief 24.4.
     merchant_slug: str | None = None
@@ -224,8 +258,14 @@ def key_hash(key: PendingKey, *, secret: str) -> str:
     the bot always holds the real key when it needs to look a row up, so there
     is nothing to gain by storing it and a mapping table to lose by doing so.
     """
-    message = f"pending:{key.chat_id}:{key.message_id}".encode()
-    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    message = f"pending:{key.chat_id}:{key.message_id}"
+    # Appended only when it is non-zero, so every row written before batches
+    # existed still hashes to the token it was stored under. Without `part` in
+    # here at all, two receipts out of one batch collide on the unique index and
+    # the second `put` silently overwrites the first.
+    if key.part:
+        message = f"{message}:{key.part}"
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
 @dataclass
@@ -274,7 +314,16 @@ class DatabasePendingStore:
             msg = f"pending row {row.id} points at a missing extraction"
             raise LookupError(msg)
 
-        extraction = ExtractionResult.model_validate(json.loads(raw.response_json))
+        group = group_from_json(raw.response_json)
+        try:
+            extraction = group.receipts[row.receipt_index]
+        except IndexError as exc:
+            msg = (
+                f"pending row {row.id} wants receipt {row.receipt_index} of an "
+                f"extraction holding {len(group.receipts)}"
+            )
+            raise LookupError(msg) from exc
+
         return PendingReceipt(
             key=key,
             user_id=row.user_id,
@@ -284,7 +333,9 @@ class DatabasePendingStore:
             mrp=cross_check_mrp(extraction),
             occurred_on_local=row.occurred_on_local,
             created_at=_aware(row.created_at),
-            image_path=Path(row.image_path) if row.image_path else None,
+            receipt_index=row.receipt_index,
+            receipt_count=len(group.receipts),
+            image_paths=_paths_from_json(row.image_paths),
             merchant_slug=row.merchant_slug,
             gap_accepted=row.gap_accepted,
             date_source=row.date_source,
@@ -305,6 +356,7 @@ class DatabasePendingStore:
                 user_id=receipt.user_id,
                 key_hash=token,
                 raw_extraction_id=receipt.raw_extraction_id,
+                receipt_index=receipt.receipt_index,
                 occurred_on_local=receipt.occurred_on_local,
                 date_source=receipt.date_source,
                 # The flow's injected clock, never the database's. A row
@@ -315,7 +367,8 @@ class DatabasePendingStore:
                 created_at=receipt.created_at,
             )
             session.add(row)
-        row.image_path = str(receipt.image_path) if receipt.image_path else None
+        row.image_paths = _paths_to_json(receipt.image_paths)
+        row.receipt_index = receipt.receipt_index
         row.merchant_slug = receipt.merchant_slug
         row.gap_accepted = receipt.gap_accepted
         row.occurred_on_local = receipt.occurred_on_local
@@ -375,6 +428,15 @@ class DatabasePendingStore:
 def _aware(when: dt.datetime) -> dt.datetime:
     """SQLite hands back naive datetimes. Compare in UTC or not at all."""
     return when if when.tzinfo is not None else when.replace(tzinfo=dt.UTC)
+
+
+def _paths_to_json(paths: Sequence[Path]) -> str | None:
+    """JSON rather than a delimiter, so a Windows backslash survives the trip."""
+    return json.dumps([str(path) for path in paths]) if paths else None
+
+
+def _paths_from_json(text: str | None) -> tuple[Path, ...]:
+    return tuple(Path(entry) for entry in json.loads(text)) if text else ()
 
 
 __all__ = [

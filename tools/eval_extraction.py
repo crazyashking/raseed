@@ -167,7 +167,16 @@ def live_run(provider: GeminiProvider, paths: list[pathlib.Path]) -> int:
             print(f"  {image.stem:14s} ERROR {type(exc).__name__}: {exc}")
             continue
 
-        actual = result.extraction
+        # Every eval image is one receipt, so a group holding anything else is
+        # itself the finding and is worth seeing rather than averaging away.
+        if len(result.group.receipts) != 1:
+            print(
+                f"  {image.stem:14s} DIFF read {len(result.group.receipts)} receipts "
+                f"out of one image"
+            )
+            continue
+
+        actual = result.group.receipts[0]
         differences = compare(actual, expected)
         verdict = reconcile(actual)
         mrp = cross_check_mrp(actual)
