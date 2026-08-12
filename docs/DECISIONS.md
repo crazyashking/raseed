@@ -1998,63 +1998,68 @@ is visible and recoverable, which the old failure was not.
 
 ---
 
-### Proposal for brief section 3.11, not written into the brief
+### Brief section 3.11 is written, and invariant 9 is not amended
 
-**Raised 2026-08-12. Needs Ashrit's ruling before anything is built.**
+**Decided 2026-08-12.** Raised as a proposal the same day; Ashrit delegated the call with
+"make the best decision for this, I just want to make sure that all the important data is
+recorded." That last clause is what decided it.
 
-Section 3.11 is cited four times and has never existed. It is meant to define
-tiling for the very tall receipts, and CLAUDE.md says the brief does not get
-silently deviated from, so this is a proposal in the decisions log rather than a
-section invented in the brief.
+Section 3.11 was cited four times and had never existed. It is meant to cover the very tall
+receipt, the `blinkit_019/020/021` case at roughly 7200px. It is now written into the brief.
 
-**What the gap actually is.** A 30-item receipt photographed end to end is a very
-tall, very narrow image. Two things can go wrong with one and they need telling
-apart:
+**The question that needed a ruling.** Does slicing a tall image into overlapping strips
+count as editing it under invariant 9, which forbids image editing, upscaling and
+enhancement anywhere in the pipeline?
 
-1. The image is downscaled before the model reads it, so the small print at the
-   bottom is gone before extraction starts.
-2. The image is read fine and the model stops early, returning the first N items.
+**Ruled: yes, it counts, and slicing is out.** Three reasons, in the order they matter.
 
-Only the first is a tiling problem. `media_resolution` is already plumbed through
-`GeminiProvider` and left unset, which was the placeholder for this.
+Cropping is not free. It means decode and re-encode, and for a JPEG that changes pixel
+values through lossy recompression. Arguing that a crop is "only selecting a region"
+requires reading the invariant the way nobody is supposed to read it, and an invariant that
+survives one lawyerly reading survives the next one too.
 
-**The proposal, in order, cheapest first.**
+Overlapping strips are a way to count a line item twice. Reconciliation catches that as a
+Class 2 gap, so it surfaces as a question rather than a wrong number, which is the system
+working. It still converts a clean reading into an interruption, and Ashrit's stated
+priority is that the data lands correctly.
 
-- **Measure before building.** `count_input_tokens` is free on Gemini and already
-  called. Render or photograph a 30-item receipt, count the tokens at each
-  `media_resolution` setting, and run it through the eval scorer. If accuracy at
-  the default is fine, 3.11 is one sentence saying so and nothing is built.
-- **If it is a resolution problem**, set `media_resolution` high for images past
-  a height threshold and record the setting in `raw_extractions.extra`, so a
-  regression is attributable. One config knob, no new dependency, no invariant
-  touched.
-- **If it is a stopping problem**, tiling does not help and the answer is a
-  continuation field on the schema, not an image change.
-- **Slicing the image into overlapping strips is the last resort**, and it needs
-  a ruling first: invariant 9 forbids image editing, upscaling and enhancement
-  anywhere in the pipeline, and whether cropping to strips counts is Ashrit's
-  call, not mine. It is the same question the PDF-render path in 3.10 raises.
+Nothing cheaper has been tried. `media_resolution` is already plumbed through
+`GeminiProvider` and deliberately unset, and it touches no image at all. A model that stops
+early is not a tiling problem in the first place, and no amount of image handling fixes it.
 
-**What the 2026-08-12 work already covers.** A receipt sent as two photographs is
-now one call and one row, which is the ordinary way a person handles a bill too
-long for one frame. That removes the pressure from 3.11 without answering it: it
-is the user solving the framing problem manually.
+**What the section says instead.** Measure first, because `count_input_tokens` is free.
+Then a config value if it is a resolution problem, a schema continuation field if it is a
+stopping problem, and an explicit return to this question if both fail. Step four is a
+conversation, never a quiet reinterpretation.
 
-**Confidence.** High that the batch path is the right answer for the common case,
-because it is the failure that was actually reported and it is now tested. Low on
-anything about how Gemini tiles a tall image, because I have not measured it and
-have no first-party source in front of me. That is what step one is for.
+**Step one cannot run yet.** The tall eval receipts are among the 30 missing PNGs. The two
+that survive measure 1600x1982 and 1600x1624, both near square, so neither reproduces the
+case. Restoring or re-rendering those images is what unblocks it.
+
+**On recording the important data, which was the actual ask.** Nothing new is needed. Every
+reading already writes its verbatim response, `input_tokens`, `output_tokens` and cost to an
+immutable `raw_extractions` row, so the two failure modes are distinguishable after the fact
+without a schema change: high input tokens with few items is a downscaled image, ordinary
+tokens with few items is a model that stopped.
+
+Two fields were removed the same day for the opposite reason. `ProviderResult.extra` was a
+dict no provider wrote, nothing read, and `record_extraction` did not persist, so a value
+put in it would have evaporated. `count_input_tokens` carried a docstring saying it was
+called before every paid request to catch an oversized image, and the bot has never called
+it. A field that looks like it records something and records nothing is worse than no field,
+and a docstring describing a safeguard that does not exist is worse than silence.
+
+**The batch work already covers the ordinary case**, which is why none of this is urgent. A
+bill too long for one frame is photographed in two and read as one call.
 
 ---
 
 ## Still open
 
-- **Brief sections 3.10 and 3.11 do not exist.** Referenced four times, never
-  written. 3.10 defines the PDF-text-layer versus vision router and blocks
-  commit 5. 3.11 defines tiling for the tall 30-item receipts. Not inventing
-  either one. A proposal for 3.11 is written up above, dated 2026-08-12, and
-  wants a ruling on one question in particular: whether slicing a tall image
-  into overlapping strips counts as editing it under invariant 9.
+- **Brief section 3.10 does not exist.** Referenced, never written. It defines
+  the PDF-text-layer versus vision router and blocks commit 5. Not inventing it.
+  ~~3.11~~ **written 2026-08-12**, see the ruling above: invariant 9 stands,
+  slicing is out, and measuring comes first.
 - **Thirty of the 32 eval PNGs are absent**, along with `blinkit_000.png` (the
   redacted real receipt) and `docs/RASEED_TEST_DATA_PROMPTS.md`. Needed at
   commit 6, not before. Either Ashrit restores them or they get re-rendered,

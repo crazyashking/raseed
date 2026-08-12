@@ -313,6 +313,59 @@ spending that would otherwise never enter the ledger at all.
 
 ---
 
+### 3.11 Receipts too tall to read in one frame **[DECIDED 2026-08-12]**
+
+Written on 2026-08-12, when Ashrit delegated the call. It was cited four times before it
+existed. Section 3.10 is still open and unrelated.
+
+A 30-item receipt photographed end to end is a very tall, very narrow image. Two different
+things go wrong with one and they need telling apart, because only the first is a tiling
+problem:
+
+1. The image is downscaled before the model reads it, so the bottom of the bill is gone
+   before extraction starts.
+2. The image is read fine and the model stops early, returning the first N items.
+
+**Invariant 9 stands unchanged, and slicing an image into strips is ruled out.** Cropping
+means decode and re-encode, which for a JPEG changes pixel values through lossy
+recompression. Calling that "only selecting a region" is the kind of lawyerly reading whose
+absence is the entire value of an invariant stated in one line. Overlapping strips also
+introduce a way to count a line item twice; reconciliation catches that as a Class 2 gap
+rather than storing it silently, so it is a question put to the user instead of a wrong
+number, and it is still the wrong trade to make before anything cheaper has been measured.
+
+The ordered approach, cheapest first. Nothing past step one gets built until step one says
+which failure this actually is.
+
+1. **Measure.** `count_input_tokens` is free on Gemini. Count a tall receipt at each
+   `media_resolution` setting and run it through `tools/eval_extraction.py`. If accuracy at
+   the default is fine, this section is finished and nothing is built.
+2. **If it is a resolution problem**, set `media_resolution` for images past a height
+   threshold. It is already plumbed through `GeminiProvider` and deliberately left unset.
+   One config value, no new dependency, no image touched.
+3. **If it is a stopping problem**, tiling cannot help. The answer is a continuation field
+   on the extraction schema, which is a prompt and schema change.
+4. **If both fail**, come back and re-open the invariant 9 question explicitly. Do not
+   reach for slicing without that conversation.
+
+**What already covers the common case.** As of 2026-08-12 a bill too long for one frame is
+photographed in two and read as one call, because `ExtractionGroup` lets one reading hold
+one receipt built from several images. That is how a person actually handles this, and it
+needs no image handling at all.
+
+**Blocked on data.** Step one cannot run today. The tall eval receipts, `blinkit_019`,
+`blinkit_020` and `blinkit_021`, are among the 30 missing PNGs. The two that survive are
+1600x1982 and 1600x1624, both near square, so neither reproduces the case. This unblocks
+when those images are restored or re-rendered.
+
+**What is recorded meanwhile.** Every reading already stores its verbatim response,
+`input_tokens`, `output_tokens` and cost on an immutable `raw_extractions` row. A truncated
+tall receipt is therefore diagnosable after the fact: high input tokens with few line items
+is exactly the signature of failure 1, and normal tokens with few line items is failure 2.
+No new column is needed to tell them apart when the images come back.
+
+---
+
 ## 4. Model selection **[DECIDED: Gemini 3 Flash primary]**
 
 ### 4.1 Clearing up the earlier table
