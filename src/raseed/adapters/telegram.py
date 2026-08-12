@@ -63,7 +63,6 @@ log = logging.getLogger(__name__)
 
 ACTION_CONFIRM: Final[str] = "ok"
 ACTION_DISCARD: Final[str] = "no"
-ACTION_EDIT: Final[str] = "ed"
 ACTION_ACCEPT_GAP: Final[str] = "gap"
 ACTION_MERCHANT: Final[str] = "m"
 
@@ -517,11 +516,6 @@ class RaseedBot:
             return self._flow.set_merchant(session, key, action.split(":", 1)[1])
         if action.startswith((f"{ACTION_DATE}:", f"{ACTION_CALENDAR}:")):
             return self._dispatch_date(session, action, key)
-        if action == ACTION_EDIT:
-            return FlowResult(
-                step=Step.AWAITING_CONFIRMATION,
-                message="Pick a merchant below, or confirm as is.",
-            )
         log.warning("unknown callback action: %r", action)
         return FlowResult(step=Step.EXPIRED, message=UNKNOWN_BUTTON_MESSAGE)
 
@@ -687,7 +681,6 @@ __all__ = [
     "ACTION_CONFIRM",
     "ACTION_DATE",
     "ACTION_DISCARD",
-    "ACTION_EDIT",
     "ACTION_MERCHANT",
     "ACTION_NOOP",
     "GREETING",
