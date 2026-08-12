@@ -187,16 +187,24 @@ h2 { font-size: 11px; margin: 26px 0 10px; color: var(--muted);
 
 /* ---- receipt list ---- */
 .list { display: block; }
-.item { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+/* Top aligned, not centred. Reported on a phone: a long meta line wrapped to
+   three lines, and centring floated the amount into the middle of that stack
+   where it read as belonging to the wrapped text rather than to the row. */
+.item { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
         padding: 13px 4px; border-bottom: 1px solid var(--line); min-height: 56px; }
 .item:last-child { border-bottom: 0; }
 a.item:hover { background: var(--plane); border-radius: 8px; }
 /* The left half stacks; without an explicit block the date and the item count
    render on one line and read as "09 Aug 20264 items". */
 .item > span { display: block; min-width: 0; }
+/* The left half takes the slack and the amount never gives any up, so a long
+   item name shortens the meta line instead of squeezing the figure. */
+.item > span:first-child { flex: 1 1 auto; }
 .when { font-size: 15px; }
-.meta { display: block; font-size: 12px; color: var(--muted); margin-top: 3px; }
-.amount { font-size: 16px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.meta { display: block; font-size: 12px; color: var(--muted); margin-top: 3px;
+        overflow-wrap: anywhere; }
+.amount { flex: none; font-size: 16px; font-variant-numeric: tabular-nums;
+          white-space: nowrap; }
 .chev { color: var(--muted); font-size: 13px; margin-left: 2px; }
 
 /* ---- flags, notes, empties ---- */
@@ -557,13 +565,17 @@ def _row(row: data.Row) -> str:
         if row.flagged
         else ""
     )
+    # Every part of this is short on purpose. Reported on a phone: the meta line
+    # ran to three wrapped lines and shouldered its way into the amount and the
+    # chevron. The layout below stops them colliding; keeping the words brief is
+    # what stops the row being three lines tall in the first place.
     bits = [f"{row.item_count} item{'s' if row.item_count != 1 else ''}"]
     if row.category_minor is not None:
         # Under a tab the headline figure is this category's share, so the
         # receipt's own total has to stay visible or the row looks wrong.
-        bits.append(f"of {money(row.grand_total_minor, row.currency)} on the receipt")
+        bits.append(f"of {money(row.grand_total_minor, row.currency)}")
     if row.date_source == DateSource.MESSAGE_TIMESTAMP.value:
-        bits.append("date from the message, not the receipt")
+        bits.append("dated from your message")
     # Escape each part, then join with an entity. Escaping the joined string
     # would turn the separator into a literal "&middot;".
     meta = " &middot; ".join(escape(b) for b in bits)

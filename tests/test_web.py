@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Iterator
+from html import unescape
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -677,7 +678,7 @@ def test_a_guessed_date_says_so(seeded: tuple[Session, User]) -> None:
     txn.date_source = DateSource.MESSAGE_TIMESTAMP
     session.flush()
     html = render_index(session, user)
-    assert "date from the message, not the receipt" in html
+    assert "dated from your message" in html
 
 
 def test_the_tabs_come_from_the_category_table(seeded: tuple[Session, User]) -> None:
@@ -1195,3 +1196,46 @@ def test_the_selected_month_is_not_carried_by_colour_alone(seeded: tuple[Session
         generated_at=NOW,
     )
     assert 'aria-current="true"' in html
+
+
+def test_the_receipt_row_keeps_its_meta_line_short(seeded: tuple[Session, User]) -> None:
+    """Reported on a phone: the meta line wrapped to three lines and collided
+    with the amount and the chevron.
+
+    The layout stops them overlapping. This guards the other half of the fix,
+    which is that the words are short enough not to wrap that far to begin with.
+    The worst case is a category tab, where the receipt's own total appears
+    alongside the item count and a guessed date.
+    """
+    session, user = seeded
+    store(session, user, on=TODAY)
+    rows = data.recent(session, user_id=user.id, category_slug=UNCATEGORIZED_SLUG)
+    row = data.Row(
+        id=rows[0].id,
+        occurred_on_local=rows[0].occurred_on_local,
+        grand_total_minor=rows[0].grand_total_minor,
+        currency=rows[0].currency,
+        outcome=rows[0].outcome,
+        unaccounted_adjustment_minor=rows[0].unaccounted_adjustment_minor,
+        date_source=DateSource.MESSAGE_TIMESTAMP.value,
+        item_count=rows[0].item_count,
+        category_minor=rows[0].category_minor,
+    )
+    html = render.dashboard(
+        view=data.CurrencyView(
+            overview=data.overview(session, user_id=user.id, today=TODAY),
+            buckets=data.monthly_totals(session, user_id=user.id, months=6, today=TODAY),
+            slices=[],
+        ),
+        rows=[row],
+        generated_at=NOW,
+        active_tab=UNCATEGORIZED_SLUG,
+        active_tab_name="Uncategorized",
+    )
+    markup = html.split('<span class="meta">', 1)[1].split("</span>", 1)[0]
+    # What a reader sees, so the separator entity does not count for eight.
+    visible = unescape(markup)
+    # Roughly two lines at 12px on a 360px phone, with the amount alongside.
+    assert len(visible) <= 50, visible
+    # The old wording was half the length of the line on its own.
+    assert "not the receipt" not in visible
