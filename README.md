@@ -7,6 +7,11 @@ Send the bot a picture of a bill. It reads the line items, reconciles the
 arithmetic against the printed total, asks you to confirm, and writes an
 append-only ledger row. Then it deletes the image.
 
+Send several pictures at once and it works out whether they are pages of one
+long receipt or several separate ones, in a single reading. If nothing on the
+receipt says when it was, it asks before saving, so a bill photographed a week
+late lands in the week it was paid.
+
 Status: early. `docs/DECISIONS.md` records every architectural call and why it
 was made, including the ones that turned out wrong.
 
