@@ -96,10 +96,18 @@ class DateSource(enum.Enum):
     all, so the date often has to be inferred from the Telegram message. Never
     silently guess without recording that you guessed. Anything on
     `MESSAGE_TIMESTAMP` is editable from the confirm keyboard.
+
+    `USER_SUPPLIED` is the third value, added 2026-08-12 when that edit was
+    actually built. A person confirming a receipt they photographed a week late
+    is told the date could not be read and asked for it, and the answer they
+    give is neither printed nor guessed. Recording it as `MESSAGE_TIMESTAMP`
+    would mark a date the user typed as inferred, and the dashboard flags
+    inferred dates.
     """
 
     RECEIPT_PRINTED = "receipt_printed"
     MESSAGE_TIMESTAMP = "message_timestamp"
+    USER_SUPPLIED = "user_supplied"
 
 
 class ExtractionStage(enum.Enum):

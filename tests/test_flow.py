@@ -62,10 +62,15 @@ from raseed.extraction.providers.base import (
     ProviderTransientError,
 )
 from raseed.extraction.schemas import ExtractionResult
+from raseed.timezones import zone
 from raseed.validation.reconcile import Outcome, reconcile
 
 NOW = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
 PNG = b"\x89PNG\r\n\x1a\n" + b"receipt-bytes"
+
+#: A day well before `NOW`, for the case the date question exists to serve:
+#: someone photographing a bill a week after they paid it.
+BACKDATED = dt.date(2026, 8, 1)
 
 
 def an_extraction(name: str = "blinkit_001", **overrides: object) -> ExtractionResult:
@@ -162,6 +167,21 @@ def submit(
     )
 
 
+def commit(flow: ReceiptFlow, session: Session, key: PendingKey) -> FlowResult:
+    """Confirm, and answer the date question if the receipt raises one.
+
+    Every committed fixture has `order_datetime_local` null, because that is
+    what the app screenshots in brief 24.4 actually look like, so confirming one
+    always asks when it was. Tests that are about something else say so by going
+    through here; tests that are about the date question call `confirm` and
+    `set_date` directly and assert on both halves.
+    """
+    result = flow.confirm(session, key)
+    if result.step is Step.AWAITING_DATE:
+        result = flow.set_date(session, key, NOW.date())
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Money formatting
 # ---------------------------------------------------------------------------
@@ -223,7 +243,7 @@ def test_three_receipts_do_not_share_state(seeded: tuple[Session, User], store: 
 
     third = pendings[2]
     assert third is not None
-    result = flow.confirm(session, third.key)
+    result = commit(flow, session, third.key)
 
     assert result.step is Step.STORED
     assert result.transaction is not None
@@ -310,7 +330,7 @@ def test_confirming_writes_the_ledger_and_deletes_the_image(
     image_path = pending.image_path
     assert image_path is not None and image_path.exists()
 
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     session.commit()
 
     assert result.step is Step.STORED
@@ -346,7 +366,7 @@ def test_a_failed_confirm_leaves_the_button_usable(
     monkeypatch.setattr("raseed.adapters.flow.ledger.record_transaction", explode)
 
     with pytest.raises(RuntimeError):
-        flow.confirm(session, pending.key)
+        commit(flow, session, pending.key)
 
     # The entry is still there, the image is still there, nothing was stored.
     assert flow.pending_for(session, pending.key) is not None
@@ -356,7 +376,7 @@ def test_a_failed_confirm_leaves_the_button_usable(
 
     # And the second tap on the same button works.
     monkeypatch.undo()
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     assert result.step is Step.STORED
     assert not pending.image_path.exists()
 
@@ -397,7 +417,7 @@ def test_stage_two_failing_never_costs_the_receipt(
     pending = submit(flow, session, user).pending
     assert pending is not None
 
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     session.commit()
 
     assert result.step is Step.STORED
@@ -425,10 +445,10 @@ def test_confirming_the_same_image_twice_is_not_a_crash(
     assert first is not None and second is not None
     assert first.key != second.key
 
-    assert flow.confirm(session, first.key).step is Step.STORED
+    assert commit(flow, session, first.key).step is Step.STORED
     session.commit()
 
-    result = flow.confirm(session, second.key)
+    result = commit(flow, session, second.key)
     session.commit()
 
     assert result.step is Step.DUPLICATE
@@ -453,7 +473,7 @@ def test_an_expired_confirm_says_which_thing_happened(
     # What a restart looks like from here: same key, empty store.
     restarted = make_flow(StubProvider(an_extraction()), store)
 
-    result = restarted.confirm(session, pending.key)
+    result = commit(restarted, session, pending.key)
 
     assert result.step is Step.EXPIRED
     assert "24 hours" in result.message
@@ -506,8 +526,8 @@ def test_a_decision_cannot_be_applied_twice(
     pending = submit(flow, session, user).pending
     assert pending is not None
 
-    assert flow.confirm(session, pending.key).step is Step.STORED
-    assert flow.confirm(session, pending.key).step is Step.EXPIRED
+    assert commit(flow, session, pending.key).step is Step.STORED
+    assert commit(flow, session, pending.key).step is Step.EXPIRED
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +594,7 @@ def test_an_accepted_gap_is_stored_as_an_adjustment(
     assert pending is not None
     flow.accept_gap(session, pending.key)
 
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     session.commit()
 
     assert result.transaction is not None
@@ -620,7 +640,7 @@ def test_the_same_image_twice_is_caught(seeded: tuple[Session, User], store: Ima
     flow = make_flow(StubProvider(an_extraction()), store)
     pending = submit(flow, session, user).pending
     assert pending is not None
-    flow.confirm(session, pending.key)
+    commit(flow, session, pending.key)
     session.commit()
 
     again = submit(flow, session, user, message_id=2)
@@ -640,7 +660,7 @@ def test_a_soft_deleted_row_does_not_block_a_resend(
     flow = make_flow(StubProvider(an_extraction()), store)
     pending = submit(flow, session, user).pending
     assert pending is not None
-    stored = flow.confirm(session, pending.key)
+    stored = commit(flow, session, pending.key)
     assert stored.transaction is not None
     stored.transaction.deleted_at = NOW
     session.commit()
@@ -713,7 +733,7 @@ def test_a_pending_receipt_expires(seeded: tuple[Session, User], store: ImageSto
     assert pending is not None
 
     clock["now"] = NOW + dt.timedelta(hours=25)
-    assert flow.confirm(session, pending.key).step is Step.EXPIRED
+    assert commit(flow, session, pending.key).step is Step.EXPIRED
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +816,7 @@ def test_the_pending_store_does_not_deadlock_against_its_caller(
         session.commit()
 
     with file_sessions() as session:
-        assert flow.confirm(session, result.pending.key).step is Step.STORED
+        assert commit(flow, session, result.pending.key).step is Step.STORED
         session.commit()
 
     with file_sessions() as session:
@@ -881,7 +901,7 @@ def test_a_restart_does_not_kill_an_outstanding_confirm(
 
     # The restart. A brand new flow and a brand new store, same database.
     with shared_sessions() as session:
-        after = build().confirm(session, key)
+        after = commit(build(), session, key)
         session.commit()
 
     assert after.step is Step.STORED, "the confirm button died across a restart"
@@ -919,10 +939,10 @@ def test_a_confirm_still_cannot_be_applied_twice(
     assert result.pending is not None
 
     with shared_sessions() as session:
-        assert flow.confirm(session, result.pending.key).step is Step.STORED
+        assert commit(flow, session, result.pending.key).step is Step.STORED
         session.commit()
     with shared_sessions() as session:
-        assert flow.confirm(session, result.pending.key).step is Step.EXPIRED
+        assert commit(flow, session, result.pending.key).step is Step.EXPIRED
         assert pending_store.count(session) == 0
 
 
@@ -1046,7 +1066,7 @@ def test_a_persisted_pending_receipt_still_expires(
 
     clock["now"] = NOW + dt.timedelta(hours=25)
     with shared_sessions() as session:
-        assert flow.confirm(session, result.pending.key).step is Step.EXPIRED
+        assert commit(flow, session, result.pending.key).step is Step.EXPIRED
 
     with shared_sessions() as session:
         dead = flow.expire_stale(session)
@@ -1112,7 +1132,7 @@ def every_terminal_message(session: Session, user: User, store: ImageStore) -> d
     awaiting = submit(good, session, user)
     messages[Step.AWAITING_CONFIRMATION] = awaiting.message
     assert awaiting.pending is not None
-    messages[Step.STORED] = good.confirm(session, awaiting.pending.key).message
+    messages[Step.STORED] = commit(good, session, awaiting.pending.key).message
     session.commit()
 
     duplicate = submit(good, session, user, message_id=2)
@@ -1238,11 +1258,15 @@ def test_a_receipt_with_no_printed_date_falls_back_to_the_message(
     # ledger came out right while `pending_receipts.date_source` said the date
     # was printed on every row it ever held.
     assert pending.date_source is DateSource.MESSAGE_TIMESTAMP
+    assert pending.occurred_on_local == NOW.astimezone(zone("Asia/Kolkata")).date()
 
+    # And the guess is what the question is asked about, so it is never what
+    # gets written. Nothing is in the ledger at this point.
     result = flow.confirm(session, pending.key)
     session.commit()
-    assert result.transaction is not None
-    assert result.transaction.date_source is DateSource.MESSAGE_TIMESTAMP
+    assert result.step is Step.AWAITING_DATE
+    assert result.transaction is None
+    assert session.scalars(select(Transaction)).all() == []
 
 
 def test_a_guessed_date_survives_the_pending_store(
@@ -1253,6 +1277,10 @@ def test_a_guessed_date_survives_the_pending_store(
     `confirm` reads `receipt.date_source` instead of parsing the extraction a
     second time, so a store that dropped the field on the way to disk would file
     every guessed date as printed. Only a real round trip can show that.
+
+    It is also what decides whether the date question gets asked, so a store
+    that lost it would send a receipt straight to the ledger under a date nobody
+    was ever shown.
     """
     flow = ReceiptFlow(
         provider=StubProvider(an_extraction()),
@@ -1284,12 +1312,128 @@ def test_a_guessed_date_survives_the_pending_store(
         rebuilt = flow.pending_for(session, result.pending.key)
         assert rebuilt is not None
         assert rebuilt.date_source is DateSource.MESSAGE_TIMESTAMP
-        assert flow.confirm(session, result.pending.key).transaction is not None
+        assert flow.confirm(session, result.pending.key).step is Step.AWAITING_DATE
+        assert flow.set_date(session, result.pending.key, BACKDATED).transaction is not None
         session.commit()
 
     with file_sessions() as session:
         stored_row = session.scalars(select(Transaction)).one()
-        assert stored_row.date_source is DateSource.MESSAGE_TIMESTAMP
+        assert stored_row.date_source is DateSource.USER_SUPPLIED
+        assert stored_row.occurred_on_local == BACKDATED
+
+
+def test_a_printed_date_is_never_questioned(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The whole point of gating the question. Two taps stays two taps."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction(order_datetime_local="2026-07-30")), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+    assert pending.date_source is DateSource.RECEIPT_PRINTED
+
+    result = flow.confirm(session, pending.key)
+    assert result.step is Step.STORED
+    assert result.transaction is not None
+    assert result.transaction.occurred_on_local == dt.date(2026, 7, 30)
+
+
+def test_answering_the_date_question_backdates_the_row(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Invariant 6 buckets on this value, so a week-old bill has to land in its own week."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    assert flow.confirm(session, pending.key).step is Step.AWAITING_DATE
+    result = flow.set_date(session, pending.key, BACKDATED)
+    session.commit()
+
+    assert result.step is Step.STORED
+    assert result.transaction is not None
+    assert result.transaction.occurred_on_local == BACKDATED
+    # Neither printed nor guessed. The dashboard flags a guess, and this is not one.
+    assert result.transaction.date_source is DateSource.USER_SUPPLIED
+
+
+def test_the_date_question_is_asked_before_stage_two_is_paid_for(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """A person who answers nothing must not have been billed for the answer."""
+    session, user = seeded
+    categorizer = StubCategorizer()
+    flow = make_flow(StubProvider(an_extraction()), store, categorizer=categorizer)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    assert flow.confirm(session, pending.key).step is Step.AWAITING_DATE
+    assert categorizer.calls == 0
+    # And the image is still there, so the receipt is not lost either.
+    assert pending.image_path is not None
+    assert pending.image_path.exists()
+
+
+def test_an_unanswered_date_question_leaves_the_button_usable(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Asking is not consuming. The same pending entry has to survive the question."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    for _ in range(3):
+        assert flow.confirm(session, pending.key).step is Step.AWAITING_DATE
+    assert flow.pending_for(session, pending.key) is not None
+    assert flow.set_date(session, pending.key, BACKDATED).step is Step.STORED
+
+
+def test_a_date_that_has_not_happened_is_refused(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Only reachable from a stale keyboard, and cheap next to a row in a future month."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    result = flow.set_date(session, pending.key, flow.local_today() + dt.timedelta(days=1))
+    session.commit()
+
+    assert result.step is Step.AWAITING_DATE
+    assert session.scalars(select(Transaction)).all() == []
+    # Still answerable. A refusal that also threw the receipt away would be worse
+    # than the row it prevented.
+    assert flow.set_date(session, pending.key, BACKDATED).step is Step.STORED
+
+
+def test_today_means_today_where_the_user_is(store: ImageStore) -> None:
+    """Between 18:30 UTC and midnight, the server's date is tomorrow in Kolkata.
+
+    `dt.date.today()` on an Oracle box in UTC would put a receipt logged at 8pm
+    IST into the next day, which invariant 6 then buckets into the next month
+    twice a year.
+    """
+    late = dt.datetime(2026, 8, 8, 20, 0, tzinfo=dt.UTC)  # 2026-08-09 01:30 in Kolkata
+    flow = make_flow(StubProvider(an_extraction()), store, now=late)
+    assert flow.local_today() == dt.date(2026, 8, 9)
+    assert late.date() == dt.date(2026, 8, 8)
+
+
+def test_the_date_question_says_nothing_about_how_to_send(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """Invariant 10, which the 2026-08-11 exception does not extend to here."""
+    session, user = seeded
+    flow = make_flow(StubProvider(an_extraction()), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    text = flow.confirm(session, pending.key).message.lower()
+    for banned in ("send", "resend", "photo", "screenshot", "crop", "rotate", "file"):
+        assert banned not in text, text
 
 
 # ---------------------------------------------------------------------------
@@ -1320,7 +1464,7 @@ def test_the_summary_shows_the_items_and_the_total(
 def confirm_one(flow: ReceiptFlow, session: Session, user: User) -> list[TransactionLineItem]:
     pending = submit(flow, session, user).pending
     assert pending is not None
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     session.commit()
     assert result.transaction is not None
     return list(
@@ -1465,7 +1609,7 @@ def test_the_fallback_is_skipped_when_the_budget_is_gone(
     pending = submit(flow, session, user).pending
     assert pending is not None, "the submission itself was within budget"
 
-    result = flow.confirm(session, pending.key)
+    result = commit(flow, session, pending.key)
     session.commit()
 
     assert categorizer.calls == 0

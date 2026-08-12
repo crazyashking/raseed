@@ -1894,6 +1894,46 @@ under invariant 9. None of that was worth doing to avoid one sentence.
 
 ---
 
+### The date question, and a third `date_source`
+
+**Decided 2026-08-12.**
+
+Brief 24.4 said it from the start: the natural screenshot carries no date, the
+message timestamp is a guess, and "anything on `message_timestamp` is editable
+from the confirm keyboard". The editing half was never built. A bill
+photographed a week after it was paid landed under the day it was sent, and
+invariant 6 buckets on exactly that value, so it read as this week's spending.
+The only correction available was `/undo` and resend, which pays for extraction
+a second time.
+
+**When it asks.** After Confirm, and only when nothing could be read off the
+receipt. Ashrit picked that over asking every time. A receipt that prints its
+date is still two taps, and the guess is the only thing anyone is asked about.
+The question comes before Stage 2 runs, so a person who answers nothing has not
+been billed for the answer, and the pending entry is read rather than consumed
+so the buttons still work afterwards.
+
+**Today, Yesterday, Pick a date**, which is what Ashrit asked for. "Pick a date"
+opens a month grid that pages backwards. Every cell carries the whole answer in
+its callback data, so no conversation state is held between two taps and a
+restart mid-question costs nothing. The alternative was asking the user to type
+a date and parsing free text, in the one place where a misread is a row in the
+wrong month. Days after today are drawn blank, because a future day is not a day
+money was spent.
+
+**`DateSource` gains `USER_SUPPLIED`, which the brief does not list.** The brief
+names two values. A date the user chose is neither of them: it was not printed,
+and recording it as `message_timestamp` would mark an answered question as a
+guess, which is what the dashboard's "dated from your message" note reports.
+`Enum(native_enum=False)` emits no check constraint, so the column takes the new
+value with no migration.
+
+No transaction will carry `message_timestamp` again, since every guess is now
+questioned before it commits. Rows already in the ledger keep it and the
+dashboard keeps rendering it, which is the honest reading of what those rows are.
+
+---
+
 ## Still open
 
 - **Brief sections 3.10 and 3.11 do not exist.** Referenced four times, never

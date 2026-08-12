@@ -6,7 +6,9 @@ keyboard, and the action dispatch table. Everything else is `flow.py`, which
 `test_flow.py` covers.
 
 `Update` is stubbed rather than constructed, because a real one needs a `Bot`
-instance and this file must not need credentials to run.
+instance and this file must not need credentials to run. The two handlers that
+decide something on their own, `on_document` and `on_button`, get a stub that
+records what they said; everything else goes through `dispatch`.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from telegram.ext import ContextTypes
 
 from conftest import as_extraction_payload
 from raseed.adapters.flow import (
+    DATE_PROMPT,
     EXPIRED_MESSAGE,
     UNREADABLE_FILE_MESSAGE,
     FlowConfig,
@@ -35,11 +38,18 @@ from raseed.adapters.images import ImageStore
 from raseed.adapters.pending import InMemoryPendingStore, PendingKey, PendingReceipt
 from raseed.adapters.telegram import (
     ACTION_ACCEPT_GAP,
+    ACTION_CALENDAR,
     ACTION_CONFIRM,
+    ACTION_DATE,
     ACTION_DISCARD,
     ACTION_MERCHANT,
+    ACTION_NOOP,
     GREETING,
+    WEEKDAYS,
     RaseedBot,
+    calendar_keyboard,
+    date_keyboard,
+    keyboard_after,
     keyboard_for,
 )
 from raseed.db.models import User
@@ -99,8 +109,8 @@ def unbound_sessions() -> sessionmaker[Session]:
     """A factory that would work if anything asked it for a session.
 
     The synchronous surface under test here (`permitted`, `dispatch`) never
-    opens one. The async handlers do, and they are exercised end to end through
-    `flow.py` in `test_flow.py` rather than through a fake Telegram runtime.
+    opens one. The handlers that do get `wired_bot`, which is bound to the same
+    ledger the test seeded.
     """
     return sessionmaker()
 
@@ -307,6 +317,91 @@ def test_every_button_fits_telegrams_callback_limit(
 
 
 # ---------------------------------------------------------------------------
+# The date keyboards
+# ---------------------------------------------------------------------------
+
+TODAY = dt.date(2026, 8, 8)
+KEY = PendingKey(chat_id=-1009999999999999, message_id=999999999)
+
+
+def labels(markup: object) -> list[str]:
+    return [str(b.text) for row in markup.inline_keyboard for b in row]  # type: ignore[attr-defined]
+
+
+def payloads(markup: object) -> list[str]:
+    return [str(b.callback_data) for row in markup.inline_keyboard for b in row]  # type: ignore[attr-defined]
+
+
+def test_the_date_keyboard_offers_three_answers_and_a_way_out() -> None:
+    markup = date_keyboard(KEY, TODAY)
+    assert labels(markup) == ["Today", "Yesterday", "Pick a date", "Discard"]
+
+
+def test_today_and_yesterday_are_sent_as_dates_not_as_words() -> None:
+    """A keyboard left open overnight has to log the day it offered, not the day it was tapped."""
+    markup = date_keyboard(KEY, TODAY)
+    assert f"{ACTION_DATE}:2026-08-08|{KEY.chat_id}|{KEY.message_id}" in payloads(markup)
+    assert f"{ACTION_DATE}:2026-08-07|{KEY.chat_id}|{KEY.message_id}" in payloads(markup)
+
+
+def test_the_calendar_lays_the_month_out_as_a_month() -> None:
+    markup = calendar_keyboard(KEY, dt.date(2026, 8, 1), TODAY)
+    rows = markup.inline_keyboard
+    assert [str(b.text) for b in rows[1]] == list(WEEKDAYS)
+    assert str(rows[0][1].text) == "August 2026"
+    # 1 Aug 2026 is a Saturday, so five blanks come before it and the first
+    # week reads Mo..Fr empty, Sa 1, Su 2.
+    assert [str(b.text) for b in rows[2]] == [" ", " ", " ", " ", " ", "1", "2"]
+
+
+def test_the_calendar_offers_no_day_that_has_not_happened() -> None:
+    """A future day is not a day money was spent, and invariant 6 buckets on this."""
+    markup = calendar_keyboard(KEY, dt.date(2026, 8, 1), TODAY)
+    offered = {p.split(":", 1)[1].split("|", 1)[0] for p in payloads(markup) if p.startswith("d:")}
+    assert max(offered) == "2026-08-08"
+    assert len(offered) == 8
+
+
+def test_the_calendar_does_not_page_past_the_current_month() -> None:
+    current = calendar_keyboard(KEY, dt.date(2026, 8, 1), TODAY)
+    assert not any(p.startswith(f"{ACTION_CALENDAR}:2026-09") for p in payloads(current))
+
+    older = calendar_keyboard(KEY, dt.date(2026, 6, 1), TODAY)
+    assert any(p.startswith(f"{ACTION_CALENDAR}:2026-07") for p in payloads(older))
+    assert any(p.startswith(f"{ACTION_CALENDAR}:2026-05") for p in payloads(older))
+
+
+def test_the_calendar_pages_across_a_year_boundary() -> None:
+    """December to January is the one month arithmetic that gets written wrong."""
+    markup = calendar_keyboard(KEY, dt.date(2026, 1, 1), dt.date(2026, 8, 8))
+    assert any(p.startswith(f"{ACTION_CALENDAR}:2025-12") for p in payloads(markup))
+    assert any(p.startswith(f"{ACTION_CALENDAR}:2026-02") for p in payloads(markup))
+
+
+@pytest.mark.parametrize("month", [dt.date(2026, 2, 1), dt.date(2024, 2, 1), dt.date(2026, 8, 1)])
+def test_every_calendar_button_fits_telegrams_callback_limit(month: dt.date) -> None:
+    """The worst realistic key is a supergroup ID, and every cell carries one."""
+    markup = calendar_keyboard(KEY, month, dt.date(2026, 12, 31))
+    for payload in payloads(markup):
+        assert len(payload.encode()) <= 64
+
+
+def test_a_leap_day_is_offered() -> None:
+    markup = calendar_keyboard(KEY, dt.date(2024, 2, 1), dt.date(2026, 8, 8))
+    assert f"{ACTION_DATE}:2024-02-29|{KEY.chat_id}|{KEY.message_id}" in payloads(markup)
+
+
+def test_the_calendars_inert_cells_decide_nothing() -> None:
+    """Telegram has no inert cell, so the blanks and labels are buttons that must do nothing."""
+    markup = calendar_keyboard(KEY, dt.date(2026, 8, 1), TODAY)
+    blank = KEY.encode(ACTION_NOOP)
+    for row in markup.inline_keyboard:
+        for button in row:
+            if str(button.text).strip() in {"", *WEEKDAYS, "August 2026"}:
+                assert str(button.callback_data) == blank
+
+
+# ---------------------------------------------------------------------------
 # Action dispatch
 # ---------------------------------------------------------------------------
 
@@ -314,10 +409,14 @@ def test_every_button_fits_telegrams_callback_limit(
 def test_confirm_dispatches_to_the_ledger(
     seeded: tuple[Session, User], bot: RaseedBot, flow: ReceiptFlow
 ) -> None:
+    """The fixtures print no date, so confirm asks and the answer is what commits."""
     session, user = seeded
     key = pending_for(flow, session, user)
-    result = bot.dispatch(session, ACTION_CONFIRM, key)
+    assert bot.dispatch(session, ACTION_CONFIRM, key).step is Step.AWAITING_DATE
+    result = bot.dispatch(session, f"{ACTION_DATE}:2026-08-01", key)
     assert result.step is Step.STORED
+    assert result.transaction is not None
+    assert result.transaction.occurred_on_local == dt.date(2026, 8, 1)
 
 
 def test_discard_dispatches_without_writing(
@@ -348,6 +447,156 @@ def test_an_unknown_action_is_survivable(
     key = pending_for(flow, session, user)
     result = bot.dispatch(session, "wat", key)
     assert result.step is Step.EXPIRED
+
+
+def test_paging_the_calendar_decides_nothing(
+    seeded: tuple[Session, User], bot: RaseedBot, flow: ReceiptFlow
+) -> None:
+    """Six taps through the months must leave the receipt exactly where it was."""
+    session, user = seeded
+    key = pending_for(flow, session, user)
+    before = flow.pending_for(session, key)
+    assert before is not None
+
+    for month in ("2026-07", "2026-06", "2026-05"):
+        assert bot.dispatch(session, f"{ACTION_CALENDAR}:{month}", key).step is Step.AWAITING_DATE
+
+    after = flow.pending_for(session, key)
+    assert after is not None
+    assert after.occurred_on_local == before.occurred_on_local
+    assert after.date_source is before.date_source
+
+
+def test_paging_a_calendar_whose_receipt_is_gone_says_so(
+    seeded: tuple[Session, User], bot: RaseedBot, flow: ReceiptFlow
+) -> None:
+    session, user = seeded
+    key = pending_for(flow, session, user)
+    bot.dispatch(session, ACTION_DISCARD, key)
+    result = bot.dispatch(session, f"{ACTION_CALENDAR}:2026-07", key)
+    assert result.step is Step.EXPIRED
+    assert result.message == EXPIRED_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        f"{ACTION_DATE}:not-a-date",
+        f"{ACTION_DATE}:2026-02-30",
+        f"{ACTION_DATE}:",
+        f"{ACTION_CALENDAR}:2026-13",
+        f"{ACTION_CALENDAR}:nonsense",
+        f"{ACTION_CALENDAR}:",
+    ],
+)
+def test_a_malformed_date_payload_writes_nothing(
+    action: str, seeded: tuple[Session, User], bot: RaseedBot, flow: ReceiptFlow
+) -> None:
+    """Callback data is user-supplied. Anything can arrive on it."""
+    session, user = seeded
+    key = pending_for(flow, session, user)
+    result = bot.dispatch(session, action, key)
+    assert result.step is Step.EXPIRED
+    assert result.transaction is None
+    # And the receipt is still waiting, so a real button still works.
+    assert flow.pending_for(session, key) is not None
+
+
+# ---------------------------------------------------------------------------
+# Which keyboard a tap leads to
+# ---------------------------------------------------------------------------
+
+
+def test_only_paging_opens_the_calendar() -> None:
+    assert labels(keyboard_after(KEY, ACTION_CONFIRM, TODAY))[0] == "Today"
+    assert str(
+        keyboard_after(KEY, f"{ACTION_CALENDAR}:2026-06", TODAY).inline_keyboard[0][1].text
+    ) == ("June 2026")
+
+
+def test_the_calendars_back_button_returns_to_the_three_answers() -> None:
+    """Back is a Confirm, because Confirm is what asks the question."""
+    calendar = calendar_keyboard(KEY, dt.date(2026, 6, 1), TODAY)
+    back = next(b for row in calendar.inline_keyboard for b in row if str(b.text) == "Back")
+    action, key = PendingKey.decode(str(back.callback_data))
+    assert key == KEY
+    assert labels(keyboard_after(key, action, TODAY))[0] == "Today"
+
+
+class Tapper:
+    """The smallest stand-in for a callback query that records what it did."""
+
+    def __init__(self, data: str) -> None:
+        self.data = data
+        self.answers = 0
+        self.edits: list[tuple[str, object]] = []
+
+    async def answer(self, *_args: object, **_kwargs: object) -> None:
+        self.answers += 1
+
+    async def edit_message_text(self, text: str, reply_markup: object = None, **_k: object) -> None:
+        self.edits.append((text, reply_markup))
+
+
+def tap(data: str) -> tuple[Tapper, Update]:
+    query = Tapper(data)
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=ALLOWED_ID),
+        message=None,
+    )
+    return query, cast(Update, update)
+
+
+@pytest.fixture
+def wired_bot(flow: ReceiptFlow, seeded: tuple[Session, User]) -> RaseedBot:
+    """A bot whose sessions land in the same ledger the test seeded."""
+    session, _ = seeded
+    return RaseedBot(
+        flow=flow,
+        session_factory=sessionmaker(bind=session.get_bind()),
+        allowed_user_ids=frozenset({ALLOWED_ID}),
+        clock=lambda: NOW,
+        user_id_secret=SECRET,
+    )
+
+
+def test_an_inert_calendar_cell_edits_nothing(
+    seeded: tuple[Session, User], wired_bot: RaseedBot, flow: ReceiptFlow
+) -> None:
+    """Telegram rejects an edit to the text a message already has.
+
+    So a blank square has to be acknowledged and dropped. Editing anything here
+    surfaces to the user as an error on a button that was drawn to do nothing.
+    """
+    session, user = seeded
+    key = pending_for(flow, session, user)
+    session.commit()
+
+    query, update = tap(key.encode(ACTION_NOOP))
+    asyncio.run(wired_bot.on_button(update, cast(ContextTypes.DEFAULT_TYPE, None)))
+
+    assert query.answers == 1
+    assert query.edits == []
+
+
+def test_confirming_a_dateless_receipt_puts_the_date_keyboard_on_screen(
+    seeded: tuple[Session, User], wired_bot: RaseedBot, flow: ReceiptFlow
+) -> None:
+    session, user = seeded
+    key = pending_for(flow, session, user)
+    session.commit()
+
+    query, update = tap(key.encode(ACTION_CONFIRM))
+    asyncio.run(wired_bot.on_button(update, cast(ContextTypes.DEFAULT_TYPE, None)))
+
+    text, markup = query.edits[-1]
+    assert text == DATE_PROMPT
+    assert labels(markup) == ["Today", "Yesterday", "Pick a date", "Discard"]
+
+    query, update = tap(key.encode(f"{ACTION_CALENDAR}:2026-08"))
+    asyncio.run(wired_bot.on_button(update, cast(ContextTypes.DEFAULT_TYPE, None)))
+    assert "August 2026" in labels(query.edits[-1][1])
 
 
 # ---------------------------------------------------------------------------

@@ -1509,6 +1509,11 @@ Revised: default to the Telegram message date in the user's timezone, and store
 `date_source` as `receipt_printed` or `message_timestamp`. Anything on the second value is
 editable from the confirm keyboard. Never silently guess without recording that you guessed.
 
+Built 2026-08-12, with a third value. Confirm asks "when was this?" whenever nothing could
+be read off the receipt, offering today, yesterday, and a month grid for backdating. The
+answer stores `date_source` as `user_supplied`, because a date a person chose is neither
+printed nor guessed and the dashboard flags a guess. See the decisions log.
+
 **Merchant.** Not printed anywhere on this screen. Inferring it from UI styling is
 unreliable and I would not build on it. Revised: `merchant` is nullable. On extraction, if
 merchant is null, the confirm keyboard offers a quick-pick of previously seen merchants plus

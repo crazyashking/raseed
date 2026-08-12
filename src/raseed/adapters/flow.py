@@ -117,6 +117,33 @@ UNREADABLE_FILE_MESSAGE: Final[str] = (
 )
 
 
+#: Asked after Confirm, and only when no date could be read off the receipt.
+#:
+#: Brief 24.4 required this from the beginning: a screenshot of an app's item
+#: list prints no date, the message timestamp is a guess, and a receipt
+#: photographed a week after the fact buckets into the wrong month under
+#: invariant 6. The guess was recorded honestly and never questioned, so the
+#: only way to correct it was `/undo` and resend, which pays for extraction
+#: twice.
+#:
+#: Asked after Confirm rather than before, so the common case of a receipt that
+#: does print its date is still two taps.
+#:
+#: Says nothing about *how* to send a receipt. Invariant 10.
+DATE_PROMPT: Final[str] = (
+    "I could not read a date on that one, so I have not saved it yet. When was it?"
+)
+
+#: A day that has not happened cannot be a day money was spent.
+#:
+#: The calendar leaves future days blank, so this is only reachable from a
+#: keyboard that has been sitting on screen. Cheap to check and the alternative
+#: is a row that buckets into a month the dashboard has not reached.
+FUTURE_DATE_MESSAGE: Final[str] = (
+    "That day has not happened yet, so I have not saved it. Pick another one."
+)
+
+
 def already_logged_message(logged_on: dt.date, *, charged: bool) -> str:
     """What a person is told when the receipt they sent is already in the ledger.
 
@@ -199,6 +226,10 @@ class Step(Enum):
 
     #: Waiting on the user. Nothing is in the ledger yet.
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+
+    #: Confirmed, but the receipt printed no date and the guess has not been
+    #: agreed to. Nothing is in the ledger yet. Brief 24.4.
+    AWAITING_DATE = "awaiting_date"
 
     #: Written to the ledger, image deleted.
     STORED = "stored"
@@ -549,6 +580,16 @@ class ReceiptFlow:
         if receipt is None:
             return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
 
+        # Brief 24.4. A guessed date is asked about once, here, before any money
+        # is spent on Stage 2 and before a row exists. Answering it moves
+        # `date_source` off MESSAGE_TIMESTAMP, which is what lets the second pass
+        # through this method fall past the gate.
+        #
+        # After Confirm rather than before it, so a receipt that does print its
+        # date is still two taps and this costs nothing.
+        if receipt.date_source is DateSource.MESSAGE_TIMESTAMP:
+            return FlowResult(step=Step.AWAITING_DATE, message=DATE_PROMPT, pending=receipt)
+
         raw = session.get(RawExtraction, receipt.raw_extraction_id)
         if raw is None:
             self._pending.pop(session, key, now=now)
@@ -656,6 +697,37 @@ class ReceiptFlow:
             step=Step.AWAITING_CONFIRMATION, message=summarise(receipt), pending=receipt
         )
 
+    def local_today(self) -> dt.date:
+        """Today in the configured zone, which is what "Today" on a button means.
+
+        Never `dt.date.today()`. The server runs in UTC and the user does not,
+        so between 18:30 and midnight in Asia/Kolkata the two disagree and the
+        button would silently mean yesterday.
+        """
+        return self._clock().astimezone(zone(self._config.default_timezone)).date()
+
+    def set_date(self, session: Session, key: PendingKey, on: dt.date) -> FlowResult:
+        """Answer the date question, then carry straight on to committing.
+
+        Delegating to `confirm` rather than duplicating it is deliberate: the
+        duplicate check, Stage 2, the integrity race and the image deletion all
+        have to happen on this path too, and a second copy of that sequence is a
+        second place for it to drift.
+        """
+        now = self._clock()
+        receipt = self._pending.get(session, key, now=now)
+        if receipt is None:
+            return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
+        if on > self.local_today():
+            return FlowResult(step=Step.AWAITING_DATE, message=FUTURE_DATE_MESSAGE, pending=receipt)
+
+        receipt.occurred_on_local = on
+        # Not MESSAGE_TIMESTAMP any more, and not RECEIPT_PRINTED either. The
+        # dashboard flags an inferred date, and a date a person chose is not one.
+        receipt.date_source = DateSource.USER_SUPPLIED
+        self._pending.put(session, receipt)  # See `accept_gap`: aliasing is not portable.
+        return self.confirm(session, key)
+
     def set_merchant(self, session: Session, key: PendingKey, slug: str) -> FlowResult:
         """Attach a merchant picked from the quick-pick keyboard. Brief 24.4."""
         now = self._clock()
@@ -725,7 +797,9 @@ def summarise(receipt: PendingReceipt) -> str:
 
 __all__ = [
     "DATE_FORMATS",
+    "DATE_PROMPT",
     "EXPIRED_MESSAGE",
+    "FUTURE_DATE_MESSAGE",
     "UNREADABLE_FILE_MESSAGE",
     "FlowConfig",
     "FlowResult",

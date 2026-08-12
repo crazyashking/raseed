@@ -18,6 +18,7 @@ Three things here are load-bearing:
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import logging
 from collections.abc import Callable, Iterable
@@ -37,6 +38,8 @@ from telegram.ext import (
 )
 
 from raseed.adapters.flow import (
+    DATE_PROMPT,
+    EXPIRED_MESSAGE,
     UNREADABLE_FILE_MESSAGE,
     FlowResult,
     ReceiptFlow,
@@ -57,6 +60,32 @@ ACTION_DISCARD: Final[str] = "no"
 ACTION_EDIT: Final[str] = "ed"
 ACTION_ACCEPT_GAP: Final[str] = "gap"
 ACTION_MERCHANT: Final[str] = "m"
+
+#: Picks the date a receipt is logged under. Payload is an ISO date, so the
+#: whole answer travels in the button and nothing about the question is held in
+#: memory between two taps. A restart mid-question costs nothing.
+ACTION_DATE: Final[str] = "d"
+
+#: Pages the calendar. Payload is `YYYY-MM`. Changes no state at all: it swaps
+#: one keyboard for another under the same unanswered question.
+ACTION_CALENDAR: Final[str] = "cal"
+
+#: The blanks and labels that make the grid look like a calendar. Telegram has
+#: no such thing as an inert cell, so they are buttons that do nothing.
+ACTION_NOOP: Final[str] = "x"
+
+#: Monday first, matching how a calendar is printed in India and in most of the
+#: world. `calendar.monthrange` also counts from Monday, so the two agree and no
+#: offset arithmetic is needed.
+WEEKDAYS: Final[tuple[str, ...]] = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+
+#: The calendar's month arrows. Solid triangles rather than angle quotes, which
+#: render at the size of a comma next to a button label on a phone.
+BACK: Final[str] = "\N{BLACK LEFT-POINTING TRIANGLE}"
+FORWARD: Final[str] = "\N{BLACK RIGHT-POINTING TRIANGLE}"
+
+#: A button this bot did not draw, or one whose payload arrived malformed.
+UNKNOWN_BUTTON_MESSAGE: Final[str] = "I do not know what that button does."
 
 #: Telegram compresses `message.photo` and caps the long edge. A document keeps
 #: the original bytes. Both are accepted and the user is never told which is
@@ -110,6 +139,119 @@ def keyboard_for(receipt: PendingReceipt, merchants: Iterable[str] = ()) -> Inli
         if picks:
             rows.append(picks)
 
+    return InlineKeyboardMarkup(rows)
+
+
+def _calendar_month(action: str) -> dt.date | None:
+    """The month a `cal:` action is asking for, or None if it is not one.
+
+    Doubling as the recogniser keeps the parse in one place: a `cal:` action
+    that carries something unreadable is not a calendar action, so it falls
+    through to the unknown-button branch instead of raising in a handler.
+    """
+    prefix = f"{ACTION_CALENDAR}:"
+    if not action.startswith(prefix):
+        return None
+    year, _, month = action[len(prefix) :].partition("-")
+    try:
+        return dt.date(int(year), int(month), 1)
+    except ValueError:
+        return None
+
+
+def keyboard_after(key: PendingKey, action: str, today: dt.date) -> InlineKeyboardMarkup:
+    """Which of the two date keyboards an action leads to.
+
+    Split out of the handler so the choice can be tested without a Telegram
+    runtime. Every action except paging leads back to Today/Yesterday, including
+    Confirm itself, which is what makes the calendar's Back button work.
+    """
+    month = _calendar_month(action)
+    if month is None:
+        return date_keyboard(key, today)
+    return calendar_keyboard(key, month, today)
+
+
+def date_keyboard(key: PendingKey, today: dt.date) -> InlineKeyboardMarkup:
+    """The three answers to "when was this", plus a way out.
+
+    Today and yesterday are sent as ISO dates rather than as the words, so the
+    handler never has to work out what "today" meant at the moment the button
+    was drawn. A keyboard left open overnight still logs the day it offered.
+    """
+    yesterday = today - dt.timedelta(days=1)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Today", callback_data=key.encode(f"{ACTION_DATE}:{today.isoformat()}")
+                ),
+                InlineKeyboardButton(
+                    "Yesterday", callback_data=key.encode(f"{ACTION_DATE}:{yesterday.isoformat()}")
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Pick a date",
+                    callback_data=key.encode(f"{ACTION_CALENDAR}:{today:%Y-%m}"),
+                )
+            ],
+            [InlineKeyboardButton("Discard", callback_data=key.encode(ACTION_DISCARD))],
+        ]
+    )
+
+
+def calendar_keyboard(key: PendingKey, month: dt.date, today: dt.date) -> InlineKeyboardMarkup:
+    """A month grid for backdating a receipt.
+
+    Every cell is a whole answer, so paging back six months and tapping a day
+    involves no stored conversation state and survives a restart. The
+    alternative was asking the user to type a date, which means parsing free
+    text in the one place where a misread is a row in the wrong month.
+
+    Days after `today` are drawn blank. A future day is not a day money was
+    spent, and a greyed-out number that silently ignores a tap is worse than an
+    empty square that plainly is not offering anything.
+    """
+    blank = key.encode(ACTION_NOOP)
+    first = month.replace(day=1)
+    leading, days = calendar.monthrange(first.year, first.month)
+
+    previous = (first - dt.timedelta(days=1)).replace(day=1)
+    following = (first + dt.timedelta(days=days)).replace(day=1)
+    ahead = following <= today
+    header = [
+        InlineKeyboardButton(BACK, callback_data=key.encode(f"{ACTION_CALENDAR}:{previous:%Y-%m}")),
+        InlineKeyboardButton(f"{first:%B %Y}", callback_data=blank),
+        # No forward arrow out of the current month. There is nothing there.
+        InlineKeyboardButton(
+            FORWARD if ahead else " ",
+            callback_data=(key.encode(f"{ACTION_CALENDAR}:{following:%Y-%m}") if ahead else blank),
+        ),
+    ]
+
+    cells = [InlineKeyboardButton(" ", callback_data=blank)] * leading
+    for day in range(1, days + 1):
+        on = first.replace(day=day)
+        cells.append(
+            InlineKeyboardButton(
+                str(day), callback_data=key.encode(f"{ACTION_DATE}:{on.isoformat()}")
+            )
+            if on <= today
+            else InlineKeyboardButton(" ", callback_data=blank)
+        )
+
+    rows = [header, [InlineKeyboardButton(name, callback_data=blank) for name in WEEKDAYS]]
+    rows.extend(cells[start : start + 7] for start in range(0, len(cells), 7))
+    rows.append(
+        [
+            # Back to Today/Yesterday. Confirm is what asks the question, so
+            # asking it again is the way back to it, and the receipt is still
+            # unanswered so it cannot commit anything.
+            InlineKeyboardButton("Back", callback_data=key.encode(ACTION_CONFIRM)),
+            InlineKeyboardButton("Discard", callback_data=key.encode(ACTION_DISCARD)),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -247,6 +389,12 @@ class RaseedBot:
             log.warning("ignoring unrecognised callback data: %r", query.data)
             return
 
+        if action == ACTION_NOOP:
+            # A blank square or a weekday label in the calendar. The tap has
+            # already been acknowledged above, and editing a message to the text
+            # it already has is an error from Telegram, not a no-op.
+            return
+
         with self._sessions() as session:
             owner = self.owner(session, update)
             if owner is None:
@@ -266,25 +414,52 @@ class RaseedBot:
                 await query.edit_message_text(
                     result.message, reply_markup=keyboard_for(result.pending, merchants)
                 )
+            elif result.step is Step.AWAITING_DATE:
+                await query.edit_message_text(
+                    result.message,
+                    reply_markup=keyboard_after(key, action, self._flow.local_today()),
+                )
             else:
                 await query.edit_message_text(result.message)
 
     def dispatch(self, session: Session, action: str, key: PendingKey) -> FlowResult:
-        if action == ACTION_CONFIRM:
-            return self._flow.confirm(session, key)
-        if action == ACTION_DISCARD:
-            return self._flow.discard(session, key)
-        if action == ACTION_ACCEPT_GAP:
-            return self._flow.accept_gap(session, key)
+        decisions: dict[str, Callable[[Session, PendingKey], FlowResult]] = {
+            ACTION_CONFIRM: self._flow.confirm,
+            ACTION_DISCARD: self._flow.discard,
+            ACTION_ACCEPT_GAP: self._flow.accept_gap,
+        }
+        decide = decisions.get(action)
+        if decide is not None:
+            return decide(session, key)
         if action.startswith(f"{ACTION_MERCHANT}:"):
             return self._flow.set_merchant(session, key, action.split(":", 1)[1])
+        if action.startswith((f"{ACTION_DATE}:", f"{ACTION_CALENDAR}:")):
+            return self._dispatch_date(session, action, key)
         if action == ACTION_EDIT:
             return FlowResult(
                 step=Step.AWAITING_CONFIRMATION,
                 message="Pick a merchant below, or confirm as is.",
             )
         log.warning("unknown callback action: %r", action)
-        return FlowResult(step=Step.EXPIRED, message="I do not know what that button does.")
+        return FlowResult(step=Step.EXPIRED, message=UNKNOWN_BUTTON_MESSAGE)
+
+    def _dispatch_date(self, session: Session, action: str, key: PendingKey) -> FlowResult:
+        """Both halves of the date question: paging the calendar and answering it."""
+        if action.startswith(f"{ACTION_CALENDAR}:"):
+            if _calendar_month(action) is None:
+                log.warning("callback carried an unreadable month: %r", action)
+                return FlowResult(step=Step.EXPIRED, message=UNKNOWN_BUTTON_MESSAGE)
+            # Paging decides nothing, so it only has to establish that there is
+            # still a receipt behind the buttons.
+            if self._flow.pending_for(session, key) is None:
+                return FlowResult(step=Step.EXPIRED, message=EXPIRED_MESSAGE)
+            return FlowResult(step=Step.AWAITING_DATE, message=DATE_PROMPT)
+        try:
+            on = dt.date.fromisoformat(action.split(":", 1)[1])
+        except ValueError:
+            log.warning("callback carried an unreadable date: %r", action)
+            return FlowResult(step=Step.EXPIRED, message=UNKNOWN_BUTTON_MESSAGE)
+        return self._flow.set_date(session, key, on)
 
     async def recent(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         """Brief 16.3."""
@@ -408,7 +583,11 @@ class RaseedBot:
         application.add_handler(CommandHandler("undo", self.undo))
         application.add_handler(CommandHandler("dashboard", self.dashboard))
         application.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
-        application.add_handler(MessageHandler(filters.Document.IMAGE, self.on_document))
+        # Every document, not `filters.Document.IMAGE`. The narrow filter is what
+        # a PDF used to fall through, and `on_document` refusing it politely was
+        # dead code because the update never arrived. `on_document` does the MIME
+        # check itself, so widening here is what makes that refusal reachable.
+        application.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
         application.add_handler(CallbackQueryHandler(self.on_button))
         application.add_error_handler(self.on_error)
 
@@ -422,13 +601,19 @@ def build_application(token: str, bot: RaseedBot) -> Application:  # type: ignor
 
 __all__ = [
     "ACTION_ACCEPT_GAP",
+    "ACTION_CALENDAR",
     "ACTION_CONFIRM",
+    "ACTION_DATE",
     "ACTION_DISCARD",
     "ACTION_EDIT",
     "ACTION_MERCHANT",
+    "ACTION_NOOP",
     "GREETING",
     "PHOTO_MIME",
+    "WEEKDAYS",
     "RaseedBot",
     "build_application",
+    "calendar_keyboard",
+    "date_keyboard",
     "keyboard_for",
 ]
