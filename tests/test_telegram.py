@@ -44,6 +44,7 @@ from raseed.adapters.telegram import (
     ACTION_DISCARD,
     ACTION_MERCHANT,
     ACTION_NOOP,
+    BROKE_MESSAGE,
     GREETING,
     WEEKDAYS,
     RaseedBot,
@@ -569,14 +570,21 @@ def tap(data: str) -> tuple[Tapper, Update]:
 
 @pytest.fixture
 def wired_bot(flow: ReceiptFlow, seeded: tuple[Session, User]) -> RaseedBot:
-    """A bot whose sessions land in the same ledger the test seeded."""
+    """A bot whose sessions land in the same ledger the test seeded.
+
+    The album window is milliseconds rather than the shipped two seconds. The
+    wait exists to outlast a network, and there is no network between a test and
+    its own images.
+    """
     session, _ = seeded
+    session.commit()
     return RaseedBot(
         flow=flow,
         session_factory=sessionmaker(bind=session.get_bind()),
         allowed_user_ids=frozenset({ALLOWED_ID}),
         clock=lambda: NOW,
         user_id_secret=SECRET,
+        album_wait=0.05,
     )
 
 
@@ -799,34 +807,31 @@ class Album:
 
 
 async def deliver(bot: RaseedBot, *photos: Album) -> None:
-    """Hand each photograph to the bot the way the runtime would: concurrently."""
-    await asyncio.gather(
-        *(
-            bot._ingest(photo.update(), data=PNG + bytes([photo.message_id]), mime_type="image/png")
-            for photo in photos
+    """Hand the photographs over the way `Application` actually does.
+
+    One at a time, each awaited to completion before the next begins. That is
+    not a simplification: `Application` runs with `max_concurrent_updates=1` by
+    default, so an update's handlers finish before the next update is touched.
+
+    Running these with `asyncio.gather` invents concurrency the runtime does not
+    provide, and it hid a bug that made the album window useless in production:
+    with the wait awaited inside the handler, photograph two could not arrive
+    until photograph one had already been submitted alone.
+
+    The trailing sleep is the album window closing, which happens after every
+    update has been handled.
+    """
+    for photo in photos:
+        await bot._ingest(
+            photo.update(), data=PNG + bytes([photo.message_id]), mime_type="image/png"
         )
-    )
+    await asyncio.sleep(0.2)
 
 
-@pytest.fixture
-def quick_bot(flow: ReceiptFlow, seeded: tuple[Session, User]) -> RaseedBot:
-    """A wired bot that does not make the test wait two real seconds."""
-    session, _ = seeded
-    session.commit()
-    return RaseedBot(
-        flow=flow,
-        session_factory=sessionmaker(bind=session.get_bind()),
-        allowed_user_ids=frozenset({ALLOWED_ID}),
-        clock=lambda: NOW,
-        user_id_secret=SECRET,
-        album_wait=0.05,
-    )
-
-
-def test_an_album_becomes_one_call(quick_bot: RaseedBot, provider: StubProvider) -> None:
+def test_an_album_becomes_one_call(wired_bot: RaseedBot, provider: StubProvider) -> None:
     """The live failure: two photographs of one receipt were two paid calls."""
     replies = Replier()
-    asyncio.run(deliver(quick_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
+    asyncio.run(deliver(wired_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
 
     assert provider.calls == 1
     assert len(provider.seen) == 1
@@ -834,20 +839,20 @@ def test_an_album_becomes_one_call(quick_bot: RaseedBot, provider: StubProvider)
     assert len(replies.said) == 1
 
 
-def test_a_lone_photograph_is_not_waited_on(quick_bot: RaseedBot, provider: StubProvider) -> None:
+def test_a_lone_photograph_is_not_waited_on(wired_bot: RaseedBot, provider: StubProvider) -> None:
     """No `media_group_id` means nothing more is coming, so nothing is held."""
     replies = Replier()
-    asyncio.run(deliver(quick_bot, Album(None, 10, replies)))
+    asyncio.run(deliver(wired_bot, Album(None, 10, replies)))
 
     assert provider.calls == 1
     assert len(provider.seen[0].images) == 1
 
 
-def test_two_albums_at_once_do_not_mix(quick_bot: RaseedBot, provider: StubProvider) -> None:
+def test_two_albums_at_once_do_not_mix(wired_bot: RaseedBot, provider: StubProvider) -> None:
     replies = Replier()
     asyncio.run(
         deliver(
-            quick_bot,
+            wired_bot,
             Album("g1", 10, replies),
             Album("g2", 20, replies),
             Album("g1", 11, replies),
@@ -859,19 +864,56 @@ def test_two_albums_at_once_do_not_mix(quick_bot: RaseedBot, provider: StubProvi
 
 
 def test_an_album_is_read_in_the_order_it_was_sent(
-    quick_bot: RaseedBot, provider: StubProvider
+    wired_bot: RaseedBot, provider: StubProvider
 ) -> None:
     """Out-of-order delivery is normal, and page two before page one is a
     different reading of the same bill."""
     replies = Replier()
-    asyncio.run(deliver(quick_bot, Album("g1", 12, replies), Album("g1", 11, replies)))
+    asyncio.run(deliver(wired_bot, Album("g1", 12, replies), Album("g1", 11, replies)))
 
     assert provider.calls == 1
     assert [payload.data[-1] for payload in provider.seen[0].images] == [11, 12]
 
 
-def test_nothing_is_held_after_an_album_is_read(quick_bot: RaseedBot) -> None:
+def test_nothing_is_held_after_an_album_is_read(wired_bot: RaseedBot) -> None:
     """The buffer is in memory. Anything left in it is a leak that grows."""
     replies = Replier()
-    asyncio.run(deliver(quick_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
-    assert quick_bot._albums == {}
+    asyncio.run(deliver(wired_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
+    assert wired_bot._albums == {}
+
+
+def test_an_album_that_breaks_gets_an_answer_rather_than_silence(
+    wired_bot: RaseedBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The album window runs outside `Application`'s error handling entirely.
+
+    Nothing raised in there reaches `on_error`, so without its own guard a
+    failed album is exactly the silence that invariant 10's neighbours exist to
+    prevent: indistinguishable from the bot being down.
+    """
+
+    async def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(RaseedBot, "_submit", boom)
+    replies = Replier()
+    asyncio.run(deliver(wired_bot, Album("g1", 10, replies), Album("g1", 11, replies)))
+
+    assert replies.said == [BROKE_MESSAGE]
+
+
+def test_the_album_window_is_held_while_it_sleeps(wired_bot: RaseedBot) -> None:
+    """The event loop keeps only a weak reference to a task.
+
+    One nobody is holding can be collected mid-sleep, and the album goes with it.
+    """
+
+    async def check() -> None:
+        await wired_bot._ingest(
+            Album("g1", 10, Replier()).update(), data=PNG, mime_type="image/png"
+        )
+        assert len(wired_bot._gathering) == 1
+        await asyncio.sleep(0.2)
+        assert wired_bot._gathering == set()
+
+    asyncio.run(check())

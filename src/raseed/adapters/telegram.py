@@ -92,6 +92,13 @@ FORWARD: Final[str] = "\N{BLACK RIGHT-POINTING TRIANGLE}"
 #: A button this bot did not draw, or one whose payload arrived malformed.
 UNKNOWN_BUTTON_MESSAGE: Final[str] = "I do not know what that button does."
 
+#: What a person is told when something raised. Silence is the worst possible
+#: answer, because it is indistinguishable from the bot being down. Says nothing
+#: about *how* to send a receipt. Invariant 10.
+BROKE_MESSAGE: Final[str] = (
+    "Something went wrong on my end and I did not save that one. Nothing was changed."
+)
+
 #: How long an album is held open before it is read.
 #:
 #: Telegram delivers each photograph of an album as its own update sharing a
@@ -312,6 +319,10 @@ class RaseedBot:
         self._dashboard_url = dashboard_url
         self._public_url = public_url
         self._album_wait = album_wait
+        #: The album windows currently open. The event loop holds only a weak
+        #: reference to a task, so one nobody is holding can be collected while
+        #: it sleeps, taking the album with it.
+        self._gathering: set[asyncio.Task[None]] = set()
         #: Images of an album that arrived while its window is still open. In
         #: memory and deliberately so: it holds a receipt for a second or two,
         #: and a restart inside that window loses an image nobody has been
@@ -404,7 +415,18 @@ class RaseedBot:
             # task will pick this up.
             return
 
-        await self._gather(update, album)
+        # Spawned, never awaited, and that is the whole reason this works.
+        # `Application` runs with `max_concurrent_updates=1` by default, so it
+        # awaits one update's handlers to completion before it starts the next.
+        # Waiting for the album inside this handler would therefore block the
+        # updates carrying the rest of the album, and every album would arrive
+        # as one photograph followed by a separate batch for each of the others,
+        # which is the failure this exists to fix.
+        task = asyncio.create_task(self._gather(update, album))
+        # Held, because the event loop keeps only a weak reference and a task
+        # nobody is holding can be collected mid-sleep.
+        self._gathering.add(task)
+        task.add_done_callback(self._gathering.discard)
 
     async def _gather(self, update: Update, album: str) -> None:
         """Wait for the rest of an album, then submit all of it as one batch.
@@ -417,15 +439,23 @@ class RaseedBot:
         own answer, which is the honest failure: a receipt read twice is a
         confirm prompt the user can discard, and a receipt never read is money
         already spent for nothing.
+
+        Runs outside the update's own handling, so nothing raised here reaches
+        `Application`'s error handler. That is what the `except` is for: silence
+        is the one answer this bot is not allowed to give.
         """
         await asyncio.sleep(self._album_wait)
         collected = self._albums.pop(album, [])
         if not collected:  # pragma: no cover - only reachable if two tasks race
             return
         collected.sort()
-        await self._submit(
-            update, [payload for _, payload in collected], message_id=collected[0][0]
-        )
+        try:
+            await self._submit(
+                update, [payload for _, payload in collected], message_id=collected[0][0]
+            )
+        except Exception:
+            log.exception("reading an album of %d image(s) failed", len(collected))
+            await self._apologise(update)
 
     async def _submit(
         self, update: Update, images: Sequence[ImagePayload], *, message_id: int | None = None
@@ -636,14 +666,19 @@ class RaseedBot:
         bot; "try sending it as a file" would be an instruction to the user.
         """
         log.exception("unhandled error while processing an update", exc_info=context.error)
+        await self._apologise(update)
 
-        message = getattr(update, "effective_message", None)
+    async def _apologise(self, update: object) -> None:
+        """Say the one thing there is to say, and never raise doing it.
+
+        Shared with `_gather`, which runs outside `Application`'s error handling
+        entirely and would otherwise be the one path back to silence.
+        """
+        message = getattr(update, "effective_message", None) or getattr(update, "message", None)
         if message is None:
             return
         try:
-            await message.reply_text(
-                "Something went wrong on my end and I did not save that one. Nothing was changed."
-            )
+            await message.reply_text(BROKE_MESSAGE)
         except TelegramError:
             # The reply itself failed. Nothing further to try, and raising here
             # would take down the error handler as well.
@@ -683,6 +718,7 @@ __all__ = [
     "ACTION_DISCARD",
     "ACTION_MERCHANT",
     "ACTION_NOOP",
+    "BROKE_MESSAGE",
     "GREETING",
     "PHOTO_MIME",
     "WEEKDAYS",
