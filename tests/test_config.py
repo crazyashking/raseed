@@ -11,6 +11,7 @@ repo root on the development machine, and a test must not read it.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -31,7 +32,6 @@ ENV_VARS = (
     "GEMINI_API_KEY",
     "GEMINI_MODEL",
     "DATABASE_URL",
-    "DEFAULT_CURRENCY",
     "DEFAULT_TIMEZONE",
     "RECONCILIATION_TOLERANCE_MINOR",
     "DAILY_COST_LIMIT_USD",
@@ -163,6 +163,25 @@ def test_settings_load_from_a_dotenv_file(tmp_path: Path) -> None:
     assert settings.global_monthly_cost_limit_micros == 5_000_000
     assert settings.dashboard_public_url == ""
     assert settings.default_timezone == "Asia/Kolkata"
+
+
+def test_there_is_no_currency_setting_and_setting_one_does_nothing(tmp_path: Path) -> None:
+    """Decided 2026-08-13: the currency comes off the image and nowhere else.
+
+    `DEFAULT_CURRENCY` was parsed, documented and read by nothing, which is the
+    worst of both: a knob that looks like it works. A setting is the wrong shape
+    for this anyway, because one person's receipts are not all in one currency,
+    so the answer has to be per receipt and the image is the only thing that
+    knows it.
+    """
+    env = tmp_path / ".env"
+    env.write_text(
+        f"TELEGRAM_BOT_TOKEN=t\nUSER_ID_SECRET={SECRET}\nGEMINI_API_KEY=k\nDEFAULT_CURRENCY=USD\n",
+        encoding="utf-8",
+    )
+    settings = Settings.from_env(dotenv_path=env)
+
+    assert not [f.name for f in dataclasses.fields(settings) if "currency" in f.name]
 
 
 def test_the_monthly_cap_can_be_lowered_from_the_environment(tmp_path: Path) -> None:

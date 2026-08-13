@@ -178,7 +178,6 @@ class Settings:
     #: separately is what lets the expensive one move without dragging this along.
     gemini_categorizer_model: str
     database_url: str
-    default_currency: str
     default_timezone: str
     reconciliation_tolerance_minor: int
     daily_cost_limit_micros: int
@@ -213,7 +212,6 @@ class Settings:
                 "GEMINI_CATEGORIZER_MODEL", DEFAULT_CATEGORIZER_MODEL_ID
             ),
             database_url=_optional("DATABASE_URL", "sqlite:///raseed.db"),
-            default_currency=_optional("DEFAULT_CURRENCY", "INR"),
             default_timezone=_optional("DEFAULT_TIMEZONE", "Asia/Kolkata"),
             reconciliation_tolerance_minor=_int(
                 "RECONCILIATION_TOLERANCE_MINOR",

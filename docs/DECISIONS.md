@@ -2109,6 +2109,39 @@ fired, and it will still say so afterwards.
 
 ---
 
+### There is no currency setting, and there will not be one
+
+**Decided 2026-08-13 by Ashrit:** "let the bot decide from the picture being received."
+
+`DEFAULT_CURRENCY` was parsed into `Settings`, documented in `.env.example` with a comment
+saying INR only for now, and covered by a test. Nothing read it. The pre-push sweep found it
+the same day the currency work landed, which is the only reason it came up at all.
+
+The tempting fix was to wire it to `EMPTY_LEDGER_CURRENCY` in `server.py`, the hardcoded
+`INR` the dashboard falls back to before a user's first receipt. That was refused, and the
+reasoning is worth keeping, because it generalises past this one setting.
+
+**A setting is the wrong shape for the question.** One person's receipts are not all in one
+currency. Ashrit's own ledger now has rupees and dollars in it, and the receipt that started
+this was ordered on the same account as every Blinkit bill before it. So the answer is not a
+property of the user at all: it is a property of each receipt, and the only thing that knows
+it is the image. A setting would be right at most until the second country, and it would be
+wrong silently, which is exactly how the dollar receipt became rupees in the first place.
+
+`EMPTY_LEDGER_CURRENCY` stays as a hardcoded `INR`, and it is not the same thing. It is
+reached only when a user has zero receipts, where there is no image to read and the page
+still has to be denominated in something to render its empty state. Its comment already says
+so. After the first receipt lands the ledger's own currencies drive the page and it is never
+consulted again.
+
+**What this closes.** The mixed-currency case Ashrit wanted to defer needs no new decision on
+the dashboard: D13 already renders one section per currency, biggest spender first, and
+converts nothing. What remains genuinely open is a single figure spanning two currencies,
+which needs FX, a date to read the rate on, and a rounding rule. That is Job B and it stays
+deferred.
+
+---
+
 ## Still open
 
 - **Brief section 3.10 does not exist.** Referenced, never written. It defines
