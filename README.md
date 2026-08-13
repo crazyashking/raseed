@@ -28,7 +28,14 @@ Between them sits the **reconciliation gate**: line totals plus charges plus
 taxes minus order-level discounts must equal the printed grand total, within one
 rupee. A receipt that does not balance is not stored silently.
 
-Money is integer paise throughout. No floats, anywhere.
+Money is integer minor units throughout, paise for rupees and cents for dollars.
+No floats, anywhere.
+
+The currency is read off the receipt rather than assumed, and nothing is ever
+converted. A dollar bill is stored in dollars and shown in dollars, and the
+dashboard gives each currency its own section. Converting would need a rate, a
+rate needs a date to be read on, and two defensible dates give two different
+numbers.
 
 ## Not stored, by design
 
