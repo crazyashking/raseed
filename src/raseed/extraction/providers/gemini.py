@@ -97,6 +97,30 @@ def _pin_property_order(schema: types.Schema) -> types.Schema:
     return schema
 
 
+def _require(schema: types.Schema, name: str) -> types.Schema:
+    """Move `name` into `required` on every object that declares it.
+
+    Pydantic leaves a field with a default out of `required`, which tells the
+    model the field is optional and lets it answer nothing. For `currency` that
+    silence is not empty: `ExtractionResult` fills in `INR`, so an unanswered
+    question becomes a stated fact, and a dollar receipt is stored as rupees with
+    every amount correct and the unit wrong. Asking for it explicitly is the fix,
+    and the Python default stays so the immutable rows written before this keep
+    parsing. Invariant 5.
+    """
+    if schema.properties and name in schema.properties:
+        schema.required = sorted({*(schema.required or ()), name})
+
+    for child in (schema.properties or {}).values():
+        _require(child, name)
+    if schema.items is not None:
+        _require(schema.items, name)
+    for child in schema.any_of or ():
+        _require(child, name)
+
+    return schema
+
+
 @cache
 def _response_schema() -> types.Schema:
     """The extraction contract, in the shape the Gemini API accepts.
@@ -105,7 +129,8 @@ def _response_schema() -> types.Schema:
     the `$defs` and `$ref` that Pydantic emits for the nested models.
     """
     json_schema = types.JSONSchema.model_validate(ExtractionGroup.model_json_schema())
-    return _pin_property_order(types.Schema.from_json_schema(json_schema=json_schema))
+    schema = types.Schema.from_json_schema(json_schema=json_schema)
+    return _pin_property_order(_require(schema, "currency"))
 
 
 class GeminiProvider:

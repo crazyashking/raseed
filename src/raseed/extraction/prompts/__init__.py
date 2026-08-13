@@ -18,11 +18,17 @@ PROMPT_DIR = Path(__file__).parent
 
 #: What a provider uses when nothing else is specified.
 #:
+#: v3 since 2026-08-13, when a DoorDash receipt in dollars came back as rupees.
+#: v2 named only rupees and only paise, so the model had no reason to read the
+#: symbol it was looking at, and `currency` had a default waiting to be taken.
+#:
 #: v2 since 2026-08-12, when the response schema became `ExtractionGroup`. v1
 #: describes a single `ExtractionResult` and does not match that schema, so the
-#: two moved together. v1 stays on disk because rows in `raw_extractions`
-#: reference it and that reference has to keep meaning what it meant.
-DEFAULT_VERSION = "v2"
+#: two moved together.
+#:
+#: Old versions stay on disk because rows in `raw_extractions` reference them and
+#: that reference has to keep meaning what it meant.
+DEFAULT_VERSION = "v3"
 
 
 class PromptNotFoundError(LookupError):

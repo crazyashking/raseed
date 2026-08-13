@@ -49,7 +49,6 @@ from raseed.adapters.flow import (
     FlowResult,
     ReceiptFlow,
     Step,
-    rupees,
 )
 from raseed.adapters.pending import PendingKey, PendingReceipt
 from raseed.db import ledger, queries
@@ -57,6 +56,7 @@ from raseed.db.models import User
 from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ImagePayload
 from raseed.identity import user_id_for
+from raseed.money import money
 from raseed.validation.reconcile import Outcome
 
 log = logging.getLogger(__name__)
@@ -583,7 +583,8 @@ class RaseedBot:
             return
 
         lines = [
-            f"{row.occurred_on_local.isoformat()}  {rupees(row.grand_total_minor)}" for row in rows
+            f"{row.occurred_on_local.isoformat()}  {money(row.grand_total_minor, row.currency)}"
+            for row in rows
         ]
         await update.message.reply_text("\n".join(lines))
 
@@ -632,7 +633,7 @@ class RaseedBot:
                 await update.message.reply_text("Nothing to undo.")
                 return
             ledger.soft_delete_transaction(session, transaction=rows[0], when=self._clock())
-            amount = rupees(rows[0].grand_total_minor)
+            amount = money(rows[0].grand_total_minor, rows[0].currency)
             session.commit()
         await update.message.reply_text(f"Removed {amount}.")
 

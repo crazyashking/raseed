@@ -1051,11 +1051,25 @@ v0 is INR-only, but nothing stops an Instacart or DoorDash receipt from arriving
 
 - Extract the currency from the receipt as printed
 - Store the transaction with its true `currency` and native `amount_minor`
-- **Exclude non-INR transactions from all totals and dashboard views in v0**, with a note in
-  the confirm message saying it was logged but not counted
+- ~~**Exclude non-INR transactions from all totals and dashboard views in v0**, with a note
+  in the confirm message saying it was logged but not counted~~ **Superseded 2026-08-11 by
+  D13:** the dashboard renders one section per currency, biggest spender first, and converts
+  nothing. A dollar receipt is counted, in dollars, under its own heading. So there is
+  nothing to warn about and the confirm message says nothing special.
+- **Every amount shown anywhere is printed in the currency it was stored in.** Added
+  2026-08-13, after a DoorDash bill in dollars was shown as `₹72.31` on the confirm card.
+  There is no rupee-only formatter in this codebase, because the existence of one is what
+  caused this twice: `money(minor, currency)` is the only way to turn minor units into text.
 
 Storing and excluding beats rejecting, because the data is captured for when v3 adds FX and
 you do not lose those months.
+
+**Reading the currency is the model's job and it has to be asked.** `currency` carries a
+Python default of `INR` so that immutable rows written before it was asked for still parse,
+which means Pydantic leaves it out of the schema's `required` list, which means the model
+may answer nothing and have `INR` filled in on its behalf. The provider puts it back into
+`required` on the wire. Required of the model, defaulted in the parser, and those are two
+different jobs.
 
 ### 18.3 Unknown merchants
 

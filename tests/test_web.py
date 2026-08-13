@@ -49,7 +49,7 @@ from raseed.db.seed import bootstrap
 from raseed.extraction.providers.base import ProviderResult
 from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
 from raseed.identity import user_id_for
-from raseed.money import apportion, compact, money, rupees
+from raseed.money import apportion, compact, money
 from raseed.validation.reconcile import reconcile
 from raseed.web import data, render
 from raseed.web.server import Dashboard, handler_for
@@ -130,11 +130,6 @@ def store(
 )
 def test_money_formats(minor: int, currency: str, text: str) -> None:
     assert money(minor, currency) == text
-
-
-def test_rupees_still_works_after_the_move() -> None:
-    """`rupees` moved to `raseed.money`; the bot imports it from there now."""
-    assert rupees(21900) == "₹219.00"
 
 
 @pytest.mark.parametrize(

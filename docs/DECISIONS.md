@@ -2054,6 +2054,61 @@ bill too long for one frame is photographed in two and read as one call.
 
 ---
 
+### A dollar receipt printed as rupees, in two places at once
+
+**Found 2026-08-13** by Ashrit, testing a DoorDash bill from Barro's Pizza. The card read
+`Total ₹72.31` against a receipt that says `$72.31`. Every number was right and the unit was
+wrong, which is the failure mode with no arithmetic tell: reconciliation balances perfectly,
+because it balances within whatever unit it was handed.
+
+**Two independent defects, either of which produces that screenshot.**
+
+`money.py` carried `rupees(minor)`, which is `money(minor, "INR")`, and the Telegram path
+used it ten times: every line of the confirm card, the reconciliation gap, the MRP saving,
+`Logged X`, `/recent`, and `/undo`. So the card printed a rupee sign over whatever was
+stored, and the correctness of the stored row never entered into it. This is the same defect
+D13 closed on the dashboard on 2026-08-11, where 18 of 21 `money()` calls took the INR
+default. The dashboard was fixed by threading a currency through every carrier. The bot was
+not looked at, because the bug was found by reading `data.py`.
+
+The second is worse, because it reaches the ledger. `ExtractionResult.currency` has a
+default of `INR`, and Pydantic leaves a defaulted field out of `required`, so the schema sent
+to Gemini said the field was optional. A model that answers nothing gets `INR` filled in on
+its behalf, and an unasked question becomes a stated fact. The v2 prompt made that outcome
+likely rather than merely possible: it named rupees and paise and no other currency, so
+nothing in it suggested the symbol on the page was worth reading.
+
+**The fix, in three parts.**
+
+`rupees` is deleted. Not fixed at its call sites, deleted, because a formatter that hardcodes
+one currency is a loaded gun in a codebase that stores four. `money(minor, currency)` is now
+the only way to turn minor units into text, and the currency has to come from somewhere real
+at every call site.
+
+`currency` is put back into `required` on the wire, by walking the converted schema in
+`gemini.py`. The Python default stays: rows in `raw_extractions` written before today have no
+`currency` key, they are immutable, and they have to keep parsing. Required of the model and
+defaulted in the parser are two different jobs, and a test now pins each half.
+
+Prompt **v3** tells the model to read the symbol, maps the four it will see to ISO codes,
+says outright not to assume rupees, and asks it to lower `receipt_confidence` on a bare `$`
+with no country anywhere. v3 also fixes something v2 got wrong for a different reason: it
+said to multiply by 100, which invents two digits for the yen and loses one for the dinar,
+the exact bug `money.py` had before D13.
+
+**Brief 18.2 is amended.** Its instruction to exclude non-INR rows from every total was
+superseded by D13 and had been dead for two days. It now records that the dashboard gives
+each currency its own section, and adds the rule that every amount shown anywhere prints in
+the currency it was stored in.
+
+**Not fixed here: the row already in the ledger.** If Ashrit's DoorDash row stored `INR`, it
+is wrong and it stays wrong, because the ledger is append-only and `raw_extractions` is
+immutable. Invariants 2 and 5. The correction is `/undo`, which soft-deletes, and a resend
+against v3. The verbatim response on the `raw_extractions` row says which of the two defects
+fired, and it will still say so afterwards.
+
+---
+
 ## Still open
 
 - **Brief section 3.10 does not exist.** Referenced, never written. It defines

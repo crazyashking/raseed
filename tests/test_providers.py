@@ -130,17 +130,31 @@ def test_format_usd(micros: int, rendered: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v2_is_the_default_and_v1_is_still_readable() -> None:
-    """v1 is not deleted when it stops being the default.
+def test_v3_is_the_default_and_the_older_ones_are_still_readable() -> None:
+    """Superseded versions are not deleted.
 
     Rows in `raw_extractions` name the prompt that produced them and are
     immutable, so a version that goes away takes the meaning of those rows with
     it. Invariant 5.
     """
-    assert prompts.DEFAULT_VERSION == "v2"
-    assert prompts.available() == ("v1", "v2")
-    assert prompts.load().startswith("# Extraction prompt v2")
+    assert prompts.DEFAULT_VERSION == "v3"
+    assert prompts.available() == ("v1", "v2", "v3")
+    assert prompts.load().startswith("# Extraction prompt v3")
     assert prompts.load("v1").startswith("# Extraction prompt v1")
+    assert prompts.load("v2").startswith("# Extraction prompt v2")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["iso 4217", "do not assume indian rupees", "$` is `usd", "lower `receipt_confidence`"],
+)
+def test_the_prompt_tells_the_model_to_read_the_currency(phrase: str) -> None:
+    """v3, after a dollar receipt was stored as rupees on 2026-08-13.
+
+    v2 named rupees and paise and nothing else, so answering `INR` for a
+    DoorDash bill was the reading the prompt invited.
+    """
+    assert phrase in " ".join(prompts.load().lower().split())
 
 
 @pytest.mark.parametrize("phrase", ["one receipt", "count them", "distinct receipts"])
@@ -269,7 +283,7 @@ def test_a_successful_extraction_round_trips() -> None:
 
     assert result.group == group
     assert result.model_id == "gemini-3.6-flash"
-    assert result.prompt_version == "v2"
+    assert result.prompt_version == "v3"
     assert result.input_tokens == 3022
     assert result.output_tokens == 450
     assert result.cost_micros_usd == cost_micros(
@@ -370,6 +384,28 @@ def test_the_wire_schema_pins_field_order_everywhere() -> None:
     assert line_items.property_ordering.index("mrp_minor") < line_items.property_ordering.index(
         "line_total_minor"
     )
+
+
+def test_the_wire_schema_makes_the_model_answer_the_currency() -> None:
+    """2026-08-13: a dollar receipt was stored as rupees.
+
+    Pydantic leaves a defaulted field out of `required`, so `currency` was
+    optional on the wire and `ExtractionResult` turned the silence into `INR`.
+    Every amount was right and the unit was wrong, which nothing downstream can
+    catch.
+    """
+    assert "currency" in (receipt_schema().required or ())
+
+
+def test_the_python_default_survives_so_old_rows_still_parse() -> None:
+    """Required on the wire, defaulted in Python, and those are different jobs.
+
+    `raw_extractions` rows written before 2026-08-13 have no `currency` key.
+    They are immutable and have to keep parsing, so the default stays.
+    Invariant 5.
+    """
+    older = ExtractionResult.model_validate_json('{"is_receipt": true, "receipt_confidence": 0.9}')
+    assert older.currency == "INR"
 
 
 def test_the_wire_schema_resolved_the_nested_models() -> None:

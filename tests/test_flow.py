@@ -23,7 +23,6 @@ from raseed.adapters.flow import (
     Step,
     month_start_utc,
     parse_printed_date,
-    rupees,
     summarise,
 )
 from raseed.adapters.images import ImageStore, sha256_of
@@ -63,6 +62,7 @@ from raseed.extraction.providers.base import (
     ProviderTransientError,
 )
 from raseed.extraction.schemas import ExtractionGroup, ExtractionResult
+from raseed.money import money
 from raseed.timezones import zone
 from raseed.validation.reconcile import Outcome, reconcile
 
@@ -220,8 +220,8 @@ def commit(flow: ReceiptFlow, session: Session, key: PendingKey) -> FlowResult:
     ("minor", "text"),
     [(0, "₹0.00"), (100, "₹1.00"), (21900, "₹219.00"), (124050, "₹1,240.50"), (-5600, "-₹56.00")],
 )
-def test_rupees(minor: int, text: str) -> None:
-    assert rupees(minor) == text
+def test_money_formats_rupees(minor: int, text: str) -> None:
+    assert money(minor, "INR") == text
 
 
 # ---------------------------------------------------------------------------
@@ -1751,6 +1751,44 @@ def test_the_summary_shows_the_items_and_the_total(
     assert "FLAT100 Promo Code" in text
     assert "₹339.00" in text
     assert "Saved ₹56.00 against MRP" in text
+
+
+def test_the_summary_prints_the_currency_the_receipt_was_written_in(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """2026-08-13, a DoorDash bill in dollars that read `₹72.31`.
+
+    `rupees()` hardcoded INR at every call site on this path, so the card put a
+    rupee sign over whatever was stored. Brief 18.2 says store the true
+    currency, and the card is the number the user is asked to confirm before a
+    row is written, so it has to be the number the receipt printed.
+    """
+    session, user = seeded
+    extraction = an_extraction("blinkit_026").model_copy(update={"currency": "USD"})
+    flow = make_flow(StubProvider(extraction), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    text = summarise(pending)
+    assert "$339.00" in text
+    assert "Saved $56.00 against MRP" in text
+    assert "₹" not in text
+
+
+def test_the_logged_confirmation_prints_the_stored_currency(
+    seeded: tuple[Session, User], store: ImageStore
+) -> None:
+    """The last thing said about a receipt names the same unit as the row."""
+    session, user = seeded
+    extraction = an_extraction("blinkit_026").model_copy(update={"currency": "USD"})
+    flow = make_flow(StubProvider(extraction), store)
+    pending = submit(flow, session, user).pending
+    assert pending is not None
+
+    result = commit(flow, session, pending.key)
+    assert result.transaction is not None
+    assert result.transaction.currency == "USD"
+    assert result.message == "Logged $339.00."
 
 
 # ---------------------------------------------------------------------------

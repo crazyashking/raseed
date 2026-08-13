@@ -40,11 +40,6 @@ def exponent(currency: str) -> int:
     return EXPONENTS.get(currency.upper(), 2)
 
 
-def rupees(minor: int) -> str:
-    """Format integer paise for a human. Never builds a float."""
-    return money(minor, "INR")
-
-
 def average(total_minor: int, count: int) -> int:
     """The mean of `count` amounts totalling `total_minor`, in whole minor units.
 
@@ -157,5 +152,4 @@ __all__ = [
     "compact",
     "exponent",
     "money",
-    "rupees",
 ]

@@ -60,7 +60,7 @@ from raseed.extraction.providers.base import (
     ProviderTransientError,
 )
 from raseed.extraction.schemas import ExtractionResult
-from raseed.money import rupees
+from raseed.money import money
 from raseed.timezones import zone
 from raseed.validation.reconcile import (
     DEFAULT_TOLERANCE_MINOR,
@@ -745,7 +745,7 @@ class ReceiptFlow:
         self._delete_images(receipt.image_paths)
         return FlowResult(
             step=Step.STORED,
-            message=f"Logged {rupees(transaction.grand_total_minor)}.",
+            message=f"Logged {money(transaction.grand_total_minor, transaction.currency)}.",
             transaction=transaction,
         )
 
@@ -838,8 +838,15 @@ class ReceiptFlow:
 
 
 def summarise(receipt: PendingReceipt) -> str:
-    """The parsed summary the user confirms against. Brief 3.4."""
+    """The parsed summary the user confirms against. Brief 3.4.
+
+    Every amount is printed in the currency the receipt was written in, per brief
+    18.2. A DoorDash bill in dollars shown with a rupee sign is a lie about a
+    number the user is being asked to confirm, and confirming it is what writes
+    the row.
+    """
     extraction = receipt.extraction
+    currency = extraction.currency
     lines: list[str] = []
     if receipt.receipt_count > 1:
         # Several confirm prompts arriving at once are otherwise indistinguishable
@@ -853,26 +860,26 @@ def summarise(receipt: PendingReceipt) -> str:
 
     for item in extraction.line_items:
         quantity = f" ({item.quantity_text})" if item.quantity_text else ""
-        lines.append(f"  {item.raw_name}{quantity}  {rupees(item.line_total_minor)}")
+        lines.append(f"  {item.raw_name}{quantity}  {money(item.line_total_minor, currency)}")
 
     for charge in extraction.charges:
-        lines.append(f"  + {charge.label}  {rupees(charge.amount_minor)}")
+        lines.append(f"  + {charge.label}  {money(charge.amount_minor, currency)}")
     for tax in extraction.taxes:
-        lines.append(f"  + {tax.label}  {rupees(tax.amount_minor)}")
+        lines.append(f"  + {tax.label}  {money(tax.amount_minor, currency)}")
     for discount in extraction.discounts:
-        lines.append(f"  - {discount.label}  {rupees(discount.amount_minor)}")
+        lines.append(f"  - {discount.label}  {money(discount.amount_minor, currency)}")
 
-    lines.append(f"Total  {rupees(extraction.grand_total_minor or 0)}")
+    lines.append(f"Total  {money(extraction.grand_total_minor or 0, currency)}")
 
     verdict = receipt.reconciliation
     if verdict.outcome is Outcome.CLASS_2 and verdict.delta_minor is not None:
         lines.append("")
         lines.append(
-            f"The items add up to {rupees(verdict.computed_total_minor)}, "
-            f"which is {rupees(abs(verdict.delta_minor))} off the printed total."
+            f"The items add up to {money(verdict.computed_total_minor, currency)}, "
+            f"which is {money(abs(verdict.delta_minor), currency)} off the printed total."
         )
     if receipt.mrp.derived_savings_minor:
-        lines.append(f"Saved {rupees(receipt.mrp.derived_savings_minor)} against MRP.")
+        lines.append(f"Saved {money(receipt.mrp.derived_savings_minor, currency)} against MRP.")
 
     return "\n".join(lines)
 
@@ -891,6 +898,5 @@ __all__ = [
     "extraction_failed_message",
     "month_start_utc",
     "parse_printed_date",
-    "rupees",
     "summarise",
 ]
